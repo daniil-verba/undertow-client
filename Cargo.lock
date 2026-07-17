@@ -913,7 +913,7 @@ dependencies = [
 [[package]]
 name = "undertow-protocol"
 version = "0.1.2"
-source = "git+https://github.com/daniil-verba/undertow-protocol?branch=dev#051862bb356a4d963bd56934c3f463ed13a1ddd7"
+source = "git+https://github.com/daniil-verba/undertow-protocol?branch=dev#5a42a5bd4e3e1f6c92223668e12f2da7bfe36cd2"
 dependencies = [
  "crc32fast",
  "dirs",

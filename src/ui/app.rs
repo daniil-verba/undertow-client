@@ -1,8 +1,4 @@
 //! ## TUI Application / TUI-приложение
-//!
-//! Beautiful terminal interface for the Undertow node.
-//! / Красивый терминальный интерфейс для узла Undertow.
-
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     backend::Backend,
@@ -14,46 +10,28 @@ use ratatui::{
 };
 use std::io;
 
-/// Application state / Состояние приложения
 pub struct App {
-    /// My PeerId / Мой PeerId
     pub peer_id: String,
-    /// My short PeerId / Мой короткий PeerId
     pub peer_id_short: String,
-    /// My username / Моё имя пользователя
     pub username: String,
-    /// Local IP addresses / Локальные IP-адреса
     pub local_addrs: Vec<String>,
-    /// External IP:port from STUN / Внешний IP:порт от STUN
     pub external_addr: Option<String>,
-    /// NAT type / Тип NAT
     pub nat_type: String,
-    /// Connected beacon address / Адрес подключённого маяка
     pub beacon_addr: Option<String>,
-    /// LAN mode flag / Флаг LAN режима
     pub lan_mode: bool,
-    /// Chat messages: (sender_short, sender_full, text_with_time)
-    pub messages: Vec<(String, String, String)>,
-    /// Input buffer / Буфер ввода
+    pub messages: Vec<(String, String, String)>, // (sender_short, sender_full, text_with_time)
     pub input: String,
-    /// Input mode / Режим ввода
     pub input_mode: InputMode,
-    /// Scroll position / Позиция прокрутки
     pub scroll: usize,
-    /// Connected peers / Подключённые пиры
     pub connected_peers: Vec<String>,
-    /// Connected peers with usernames / Подключённые пиры с именами
-    pub connected_peers_info: Vec<(String, String)>, // (peer_id, username)
-    /// LAN peers count / Количество LAN пиров
+    pub connected_peers_info: Vec<(String, String)>, // (peer_id_hex, username)
     pub lan_peer_count: usize,
-    /// Status message / Статусное сообщение
     pub status: String,
-    /// Show help popup / Показать всплывающую справку
     pub show_help: bool,
-    /// Show peers popup / Показать список пиров
     pub show_peers: bool,
-    /// Mode indicator / Индикатор режима
     pub mode: String,
+    pub selected_chat: Option<String>, // None = broadcast, Some(peer_id_hex) = DM
+    pub peer_cursor: usize,            // курсор в списке пиров
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +41,6 @@ pub enum InputMode {
 }
 
 impl App {
-    /// Creates a new App with node info.
     pub fn new(
         peer_id: String,
         username: String,
@@ -75,7 +52,6 @@ impl App {
         let peer_id_short = peer_id.chars().take(8).collect();
         let lan_mode = beacon_addr.is_none();
         let mode = if lan_mode { "🏠 LAN" } else { "🗼 Beacon" };
-
         Self {
             peer_id,
             peer_id_short,
@@ -96,10 +72,11 @@ impl App {
             show_help: false,
             show_peers: false,
             mode: mode.to_string(),
+            selected_chat: None,
+            peer_cursor: 0,
         }
     }
 
-    /// Adds a received chat message.
     pub fn add_message(&mut self, sender_full: String, text: String) {
         let sender_short: String = sender_full.chars().take(8).collect();
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -108,9 +85,9 @@ impl App {
         if self.messages.len() > 500 {
             self.messages.remove(0);
         }
+        self.scroll = self.messages.len().saturating_sub(1);
     }
 
-    /// Adds a system message (yellow SYS prefix).
     pub fn add_system_message(&mut self, text: String) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
         self.messages.push((
@@ -118,9 +95,9 @@ impl App {
             "SYSTEM".to_string(),
             format!("[{}] {}", time, text),
         ));
+        self.scroll = self.messages.len().saturating_sub(1);
     }
 
-    /// Adds a connected peer with username.
     pub fn add_peer(&mut self, peer_id: String, username: String) {
         let short_id = if peer_id.len() > 8 {
             format!("{}...", &peer_id[..8])
@@ -134,13 +111,14 @@ impl App {
         }
     }
 
-    /// Removes a connected peer.
     pub fn remove_peer(&mut self, peer_id: &str) {
         self.connected_peers_info.retain(|(id, _)| id != peer_id);
         self.connected_peers.retain(|p| !p.contains(peer_id));
+        if self.peer_cursor >= self.connected_peers_info.len() {
+            self.peer_cursor = self.connected_peers_info.len().saturating_sub(1);
+        }
     }
 
-    /// Updates peer list from beacon info.
     pub fn update_peers(&mut self, peers: Vec<(String, String)>) {
         self.connected_peers.clear();
         self.connected_peers_info.clear();
@@ -149,24 +127,61 @@ impl App {
         }
     }
 
-    /// Sets LAN peer count.
     pub fn set_lan_peer_count(&mut self, count: usize) {
         self.lan_peer_count = count;
     }
 
-    /// Returns total connected peers count.
     pub fn total_peers(&self) -> usize {
         self.connected_peers.len()
     }
+
+    pub fn select_chat(&mut self, peer_id: Option<String>) {
+        self.selected_chat = peer_id;
+    }
+
+    pub fn get_chat_target_label(&self) -> String {
+        if let Some(ref id) = self.selected_chat {
+            if let Some((_, name)) = self.connected_peers_info.iter().find(|(pid, _)| pid == id) {
+                return format!("💬 DM: @{}", name);
+            }
+            return format!("💬 DM: {}...", &id[..8]);
+        }
+        "📢 Broadcast (All LAN)".to_string()
+    }
+
+    pub fn move_peer_cursor(&mut self, delta: i32) {
+        if self.connected_peers_info.is_empty() {
+            return;
+        }
+        let len = self.connected_peers_info.len();
+        self.peer_cursor = ((self.peer_cursor as i32 + delta).rem_euclid(len as i32)) as usize;
+    }
+
+    pub fn select_peer_at_cursor(&mut self) {
+        if self.connected_peers_info.is_empty() {
+            return;
+        }
+        let peer_id = self.connected_peers_info[self.peer_cursor].0.clone();
+        let username = self.connected_peers_info[self.peer_cursor].1.clone();
+        self.select_chat(Some(peer_id.clone()));
+        self.add_system_message(format!("💬 Switched to DM with @{}", username));
+    }
+
+    pub fn switch_to_broadcast(&mut self) {
+        if self.selected_chat.is_some() {
+            self.select_chat(None);
+            self.add_system_message("📢 Switched to Broadcast mode".to_string());
+        }
+    }
 }
 
-/// Runs the TUI event loop, mutating app state in place.
+/// Runs the TUI event loop. Returns Some(input) when user presses Enter.
 pub fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<Option<String>> {
     let mut last_tick = std::time::Instant::now();
-    let tick_rate = std::time::Duration::from_millis(250);
+    let tick_rate = std::time::Duration::from_millis(200);
     loop {
         terminal.draw(|f| ui(f, app))?;
         let timeout = tick_rate
@@ -180,18 +195,47 @@ pub fn run_app<B: Backend>(
                             KeyCode::Char('q') => return Ok(Some("/quit".to_string())),
                             KeyCode::Char('e') => {
                                 app.input_mode = InputMode::Editing;
-                                app.status = "✏️ Editing mode / Режим ввода".to_string();
+                                app.status = "✏️ Editing mode".to_string();
                             }
                             KeyCode::Char('h') => app.show_help = !app.show_help,
                             KeyCode::Char('p') => app.show_peers = !app.show_peers,
                             KeyCode::Up => {
-                                if app.scroll > 0 {
+                                if app.show_peers {
+                                    app.move_peer_cursor(-1);
+                                } else if app.scroll > 0 {
                                     app.scroll -= 1;
                                 }
                             }
-                            KeyCode::Down => app.scroll += 1,
-                            KeyCode::Char('r') => {
-                                app.status = "🔄 Refreshing...".to_string();
+                            KeyCode::Down => {
+                                if app.show_peers {
+                                    app.move_peer_cursor(1);
+                                } else {
+                                    app.scroll += 1;
+                                }
+                            }
+                            KeyCode::Tab => {
+                                // Переключение между broadcast и выбранным пиром
+                                if app.selected_chat.is_some() {
+                                    app.switch_to_broadcast();
+                                } else if !app.connected_peers_info.is_empty() {
+                                    app.select_peer_at_cursor();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // Быстрый выбор пира под курсором
+                                if app.show_peers && !app.connected_peers_info.is_empty() {
+                                    app.select_peer_at_cursor();
+                                    app.show_peers = false;
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                // /chat для пира под курсором
+                                if !app.connected_peers_info.is_empty() {
+                                    app.select_peer_at_cursor();
+                                }
+                            }
+                            KeyCode::Char('b') => {
+                                app.switch_to_broadcast();
                             }
                             _ => {}
                         },
@@ -246,15 +290,13 @@ fn ui(f: &mut Frame, app: &App) {
     } else {
         format!("🗼 BEACON MODE — {}", app.username)
     };
-
     let title_color = if app.lan_mode {
         Color::Green
     } else {
         Color::Yellow
     };
-
     let title = Paragraph::new(Text::from(vec![Line::from(vec![
-        Span::styled(" 🌊 ", Style::default().fg(Color::Cyan)),
+        Span::styled("  ", Style::default().fg(Color::Cyan)),
         Span::styled(
             "UNDERTOW",
             Style::default()
@@ -286,7 +328,6 @@ fn ui(f: &mut Frame, app: &App) {
     } else {
         "🔴 None (LAN mode)".to_string()
     };
-
     let info_text = format!(
         "👤 {} ({})\n\
          📡 {}\n\
@@ -299,7 +340,6 @@ fn ui(f: &mut Frame, app: &App) {
         app.external_addr.as_deref().unwrap_or("Unknown"),
         app.nat_type,
     );
-
     let info = Paragraph::new(info_text)
         .block(
             Block::default()
@@ -320,7 +360,7 @@ fn ui(f: &mut Frame, app: &App) {
     let messages_text: Vec<Line> = app
         .messages
         .iter()
-        .map(|(short, full, text)| {
+        .map(|(short, _full, text)| {
             let color = if short == "SYS" {
                 Color::Yellow
             } else if short == &app.peer_id_short || short == &app.username {
@@ -335,16 +375,15 @@ fn ui(f: &mut Frame, app: &App) {
             } else {
                 short
             };
-
-            // Check if this is a system message with emoji indicators
             let style = if text.contains("🏠") || text.contains("LAN") {
                 Style::default().fg(Color::LightGreen)
             } else if text.contains("🗼") || text.contains("beacon") {
                 Style::default().fg(Color::Yellow)
+            } else if text.contains("💬") {
+                Style::default().fg(Color::Magenta)
             } else {
                 Style::default().fg(Color::White)
             };
-
             Line::from(vec![
                 Span::styled(
                     format!("{} ", prefix),
@@ -354,7 +393,6 @@ fn ui(f: &mut Frame, app: &App) {
             ])
         })
         .collect();
-
     let messages = Paragraph::new(Text::from(messages_text))
         .block(
             Block::default()
@@ -366,36 +404,35 @@ fn ui(f: &mut Frame, app: &App) {
         .scroll((app.scroll as u16, 0));
     f.render_widget(messages, main_chunks[0]);
 
-    // Peers list with indicators
+    // Peers list
     let mut peers_text = String::new();
-
-    if !app.connected_peers.is_empty() {
+    if !app.connected_peers_info.is_empty() {
         peers_text.push_str(&format!(
             "🌐 Network Peers ({})\n",
-            app.connected_peers.len()
+            app.connected_peers_info.len()
         ));
-        for peer in &app.connected_peers {
-            peers_text.push_str(&format!("  • {}\n", peer));
+        for (i, (peer_id, username)) in app.connected_peers_info.iter().enumerate() {
+            let short_id = if peer_id.len() > 8 {
+                format!("{}...", &peer_id[..8])
+            } else {
+                peer_id.clone()
+            };
+            let marker = if app.selected_chat.as_deref() == Some(peer_id.as_str()) {
+                "▶ "
+            } else if i == app.peer_cursor {
+                "• "
+            } else {
+                "  "
+            };
+            peers_text.push_str(&format!("{}{} (@{})\n", marker, short_id, username));
         }
     }
-
-    if app.lan_peer_count > 0 {
-        peers_text.push_str(&format!("\n🏠 LAN Peers ({})\n", app.lan_peer_count));
-        // LAN peers are shown with green indicator
-        for peer in &app.connected_peers {
-            if peer.contains("LAN") || peer.contains("🏠") {
-                peers_text.push_str(&format!("  🟢 {}\n", peer));
-            }
-        }
-    }
-
     if peers_text.is_empty() {
         peers_text = "No peers connected\nНет подключённых пиров".to_string();
         if app.lan_mode {
             peers_text.push_str("\n🔍 Searching LAN...");
         }
     }
-
     let peers = Paragraph::new(peers_text)
         .block(
             Block::default()
@@ -415,16 +452,15 @@ fn ui(f: &mut Frame, app: &App) {
     } else {
         Style::default().fg(Color::Gray)
     };
-
     let input_label = if app.input_mode == InputMode::Editing {
         " ✏️ Type message (ESC to cancel) "
     } else {
-        " [e]dit  [h]elp  [p]eers  [r]efresh  [q]uit "
+        " [e]dit [h]elp [p]eers [↑↓]nav [Tab]chat [q]uit "
     };
-
+    let input_title = format!("{} | {}", input_label, app.get_chat_target_label());
     let input = Paragraph::new(app.input.clone()).style(input_style).block(
         Block::default()
-            .title(input_label)
+            .title(input_title)
             .borders(Borders::ALL)
             .border_style(input_style),
     );
@@ -443,36 +479,34 @@ fn ui(f: &mut Frame, app: &App) {
     // === HELP POPUP ===
     if app.show_help {
         let help_text = "\
-        🌊 UNDERTOW PROTOCOL — Help / Справка\n\
-        ════════════════════════════════════════════\n\n\
-        🎮 Keys / Клавиши:\n\
-          e       — Start writing / Начать ввод\n\
-          Enter   — Send / Отправить\n\
-          ESC     — Cancel / Отмена\n\
-          h       — Toggle help / Переключить справку\n\
-          p       — Toggle peers / Список пиров\n\
-          ↑,↓     — Scroll chat / Прокрутка чата\n\
-          r       — Refresh / Обновить\n\
-          q       — Quit / Выход\n\n\
-        📝 Commands / Команды:\n\
-          /msg <username> <text>  — Send to user by name\n\
-          /send <peer_id> <text>  — Send by PeerId\n\
-          /peers                  — List all peers\n\
-          /lan                    — Show LAN peers only\n\
-          /ping <addr>            — Ping node\n\
-          /nat                    — Detect NAT\n\
-          /help                   — Show this help\n\n\
-        🏠 LAN Discovery:\n\
-          • Automatic peer discovery in local network\n\
-          • No beacon required\n\
-          • Announces every 10 seconds\n\
-          • Direct P2P communication\n\n\
-        🌐 Beacon Mode:\n\
-          • Global peer discovery\n\
-          • Relay through VPS\n\
-          • Works across the internet\n\
-        ";
-
+ UNDERTOW PROTOCOL — Help / Справка\n\
+════════════════════════════════════════════\n\n\
+🎮 Keys / Клавиши:\n\
+  e       — Start writing / Начать ввод\n\
+  Enter   — Send / Отправить\n\
+  ESC     — Cancel / Отмена\n\
+  h       — Toggle help / Переключить справку\n\
+  p       — Toggle peers list / Список пиров\n\
+  ↑,↓     — Scroll chat OR navigate peers\n\
+  Tab     — Switch chat mode (Broadcast ↔ DM)\n\
+  Enter   — (in peers popup) select peer\n\
+  c       — Chat with peer under cursor\n\
+  b       — Back to broadcast mode\n\
+  q       — Quit / Выход\n\n\
+📝 Commands / Команды:\n\
+  /chat <name>    — Start DM with user\n\
+  /broadcast      — Switch to broadcast\n\
+  /peers          — Show peers list\n\
+  /lan            — Show LAN peers\n\
+  /nat            — Detect NAT\n\
+  /help           — Show this help\n\
+  (text)          — Send message to current chat\n\n\
+ Tips:\n\
+  • Press 'p' to open peers list\n\
+  • Use ↑↓ to select peer, Enter to DM\n\
+  • Press Tab to toggle Broadcast/DM\n\
+  • Messages without '/' are sent to\n\
+    the currently selected chat target\n";
         let area = centered_rect(60, 80, f.size());
         let help = Paragraph::new(help_text)
             .block(
@@ -489,8 +523,7 @@ fn ui(f: &mut Frame, app: &App) {
     // === PEERS POPUP ===
     if app.show_peers {
         let mut peers_text = String::from("🌐 Connected Peers / Подключённые пиры\n");
-        peers_text.push_str(&format!("════════════════════════════════\n\n"));
-
+        peers_text.push_str("════════════════════════════════\n\n");
         if app.connected_peers_info.is_empty() {
             peers_text.push_str("  No peers connected\n  Нет подключённых пиров\n");
         } else {
@@ -500,18 +533,19 @@ fn ui(f: &mut Frame, app: &App) {
                 } else {
                     peer_id.clone()
                 };
-                let is_lan = app.lan_mode; // Simplified
-                let indicator = if is_lan { "🏠" } else { "🌐" };
+                let marker = if i == app.peer_cursor { "▶" } else { " " };
+                let is_selected = app.selected_chat.as_deref() == Some(peer_id.as_str());
+                let sel_mark = if is_selected { " [DM]" } else { "" };
                 peers_text.push_str(&format!(
-                    "  {:<2} {} @{} ({}...)\n",
+                    "  {} {:<2} @{} ({}){}\n",
+                    marker,
                     i + 1,
-                    indicator,
                     username,
-                    &peer_id[..8]
+                    short_id,
+                    sel_mark
                 ));
             }
         }
-
         peers_text.push_str(&format!(
             "\n  Total: {} peers",
             app.connected_peers_info.len()
@@ -519,8 +553,7 @@ fn ui(f: &mut Frame, app: &App) {
         if app.lan_peer_count > 0 {
             peers_text.push_str(&format!(" ({} LAN)", app.lan_peer_count));
         }
-        peers_text.push_str("\n\n  Press 'p' to close");
-
+        peers_text.push_str("\n\n  ↑↓ navigate | Enter select | p close");
         let area = centered_rect(50, 60, f.size());
         let peers = Paragraph::new(peers_text)
             .block(
@@ -545,7 +578,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(r);
-
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
