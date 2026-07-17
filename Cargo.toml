@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Daniil Verba <daniilverba123@gmail.com>"]
 description = "Client terminal UI for Undertow P2P network"
-license = "AGPL-3.0"
+license = "MIT"
 repository = "https://gitverse.ru/daniil-verba/undertow-client"
 
 [[bin]]
