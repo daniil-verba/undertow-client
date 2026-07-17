@@ -1,3 +1,4 @@
+//! ## Undertow Client - P2P Node with TUI
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -41,12 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nat_type_str = format!("{:?}", nat_info.nat_type);
     let external_str = nat_info.external_addr.map(|a| a.to_string());
 
-    // === ИСПОЛЬЗУЕМ LanBeacon ВМЕСТО LanDiscovery ===
+    // === ИСПОЛЬЗУЕМ LanBeacon ===
+    // start() УЖЕ запускает фоновую отправку Announce каждые 5 секунд!
     let lan_beacon = LanBeacon::new(*my_peer_id.as_bytes(), username.clone(), port).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<LanEvent>();
     lan_beacon.start(tx.clone()).await;
     println!("🏠 LAN Beacon started (multicast on 239.255.0.1:9003)");
 
+    // === TUI Setup ===
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -54,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let local_addr_strs: Vec<String> = local_addrs.iter().map(|a| a.to_string()).collect();
+
     let mut app = App::new(
         my_peer_id.to_string(),
         username.clone(),
@@ -69,14 +73,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     app.add_system_message("🔍 Searching for peers in local network...".to_string());
 
+    // === Main Loop ===
+    let mut last_status_update = std::time::Instant::now();
+    let status_update_interval = std::time::Duration::from_secs(10);
+
     loop {
-        // 1. Обрабатываем ВСЕ сетевые события (пиры находятся АВТОМАТИЧЕСКИ)
+        // 1. Обрабатываем ВСЕ сетевые события (пиры находятся АВТОМАТИЧЕСКИ каждые 5 сек)
         while let Ok(event) = rx.try_recv() {
             match event {
                 LanEvent::PeerJoined {
-                    peer_id,
-                    username,
-                    addr: _,
+                    peer_id, username, ..
                 } => {
                     let pid_hex = hex::encode(peer_id);
                     app.add_peer(pid_hex.clone(), username.clone());
@@ -105,55 +111,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        app.set_lan_peer_count(app.connected_peers_info.len());
+        app.set_lan_peer_count(app.total_peers());
 
-        // 2. Отрисовываем UI. Передаем &mut app, чтобы состояние НЕ терялось!
+        // 2. Периодическое обновление статуса (каждые 10 секунд)
+        if last_status_update.elapsed() >= status_update_interval {
+            let peer_count = app.total_peers();
+
+            if peer_count > 0 {
+                app.status = format!("🌐 {} peers connected", peer_count);
+            } else {
+                app.status = "🔍 Scanning for peers...".to_string();
+            }
+            last_status_update = std::time::Instant::now();
+        }
+
+        // 3. Отрисовываем UI (состояние сохраняется благодаря &mut app)
         let input_opt = run_app(&mut terminal, &mut app)?;
 
-        // 3. Обрабатываем ввод пользователя
+        // 4. Обрабатываем ввод пользователя
         if let Some(input) = input_opt {
             if input == "/quit" {
                 lan_beacon.stop().await;
                 break;
             }
+
             if input == "/help" || input == "help" {
                 app.show_help = true;
             } else if input == "/peers" || input == "p" {
                 app.show_peers = !app.show_peers;
             } else if input == "/lan" {
+                // РУЧНОЙ ЗАПРОС - показываем список из уже найденных пиров
                 let peers_snapshot: Vec<(String, String)> = app
                     .connected_peers_info
                     .iter()
                     .map(|(id, name)| (id.clone(), name.clone()))
                     .collect();
-                app.add_system_message(format!("🏠 Active LAN peers: {}", peers_snapshot.len()));
-                for (id, name) in &peers_snapshot {
-                    app.add_system_message(format!("  • {} ({})", name, &id[..8]));
-                }
-            } else if input.starts_with("/chat ") || input.starts_with("/dm ") {
-                let target = input[6..].trim().to_lowercase();
-                let found = app
-                    .connected_peers_info
-                    .iter()
-                    .find(|(id, name)| {
-                        id.to_lowercase().starts_with(&target) || name.to_lowercase() == target
-                    })
-                    .map(|(id, _)| id.clone());
-                if let Some(pid) = found {
-                    let uname = app
-                        .connected_peers_info
-                        .iter()
-                        .find(|(id, _)| id == &pid)
-                        .unwrap()
-                        .1
-                        .clone();
-                    app.select_chat(Some(pid.clone()));
-                    app.add_system_message(format!("💬 Switched to DM with @{}", uname));
+
+                if peers_snapshot.is_empty() {
+                    app.add_system_message(
+                        "🔍 No LAN peers found yet. Waiting for Announce...".to_string(),
+                    );
                 } else {
-                    app.add_system_message(format!("❌ Peer '{}' not found", target));
+                    app.add_system_message(format!(
+                        "🏠 Active LAN peers: {}",
+                        peers_snapshot.len()
+                    ));
+                    for (id, name) in &peers_snapshot {
+                        app.add_system_message(format!("  • {} ({})", name, &id[..8]));
+                    }
                 }
-            } else if input == "/broadcast" || input == "/bcast" {
-                app.switch_to_broadcast();
             } else if input == "/nat" {
                 let nat = NatDetector::detect(port).await;
                 app.add_system_message(format!(
@@ -161,26 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     nat.nat_type, nat.external_addr
                 ));
             } else if !input.starts_with('/') {
-                // ОТПРАВКА СООБЩЕНИЯ БЕЗ КОМАНДЫ
-                if let Some(ref target_id_hex) = app.selected_chat {
-                    if let Ok(target_bytes) = hex::decode(target_id_hex) {
-                        let mut target_array = [0u8; 32];
-                        target_array.copy_from_slice(&target_bytes);
-                        match lan_beacon
-                            .send_chat_message(target_array, input.clone())
-                            .await
-                        {
-                            Ok(_) => {
-                                app.add_message(
-                                    my_peer_id.to_string(),
-                                    format!("[→ DM] {}", input),
-                                );
-                            }
-                            Err(e) => {
-                                app.add_system_message(format!("❌ Send failed: {}", e));
-                            }
-                        }
-                    }
+                // ОТПРАВКА СООБЩЕНИЯ (Broadcast)
+                if app.total_peers() == 0 {
+                    app.add_system_message("⚠️ No peers connected. Message not sent.".to_string());
                 } else {
                     match lan_beacon.broadcast_chat_message(input.clone()).await {
                         Ok(_) => {
@@ -197,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Cleanup
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

@@ -24,14 +24,12 @@ pub struct App {
     pub input_mode: InputMode,
     pub scroll: usize,
     pub connected_peers: Vec<String>,
-    pub connected_peers_info: Vec<(String, String)>, // (peer_id_hex, username)
+    pub connected_peers_info: Vec<(String, String)>, // (peer_id, username)
     pub lan_peer_count: usize,
     pub status: String,
     pub show_help: bool,
     pub show_peers: bool,
     pub mode: String,
-    pub selected_chat: Option<String>, // None = broadcast, Some(peer_id_hex) = DM
-    pub peer_cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +70,6 @@ impl App {
             show_help: false,
             show_peers: false,
             mode: mode.to_string(),
-            selected_chat: None,
-            peer_cursor: 0,
         }
     }
 
@@ -114,66 +110,31 @@ impl App {
     pub fn remove_peer(&mut self, peer_id: &str) {
         self.connected_peers_info.retain(|(id, _)| id != peer_id);
         self.connected_peers.retain(|p| !p.contains(peer_id));
-        if self.peer_cursor >= self.connected_peers_info.len() {
-            self.peer_cursor = self.connected_peers_info.len().saturating_sub(1);
+    }
+
+    pub fn update_peers(&mut self, peers: Vec<(String, String)>) {
+        self.connected_peers.clear();
+        self.connected_peers_info.clear();
+        for (peer_id, username) in peers {
+            self.add_peer(peer_id, username);
         }
     }
 
     pub fn set_lan_peer_count(&mut self, count: usize) {
         self.lan_peer_count = count;
     }
-
     pub fn total_peers(&self) -> usize {
         self.connected_peers.len()
     }
-
-    pub fn select_chat(&mut self, peer_id: Option<String>) {
-        self.selected_chat = peer_id;
-    }
-
-    pub fn get_chat_target_label(&self) -> String {
-        if let Some(ref id) = self.selected_chat {
-            if let Some((_, name)) = self.connected_peers_info.iter().find(|(pid, _)| pid == id) {
-                return format!("💬 DM: @{}", name);
-            }
-            return format!("💬 DM: {}...", &id[..8]);
-        }
-        "📢 Broadcast (All LAN)".to_string()
-    }
-
-    pub fn move_peer_cursor(&mut self, delta: i32) {
-        if self.connected_peers_info.is_empty() {
-            return;
-        }
-        let len = self.connected_peers_info.len();
-        self.peer_cursor = ((self.peer_cursor as i32 + delta).rem_euclid(len as i32)) as usize;
-    }
-
-    pub fn select_peer_at_cursor(&mut self) {
-        if self.connected_peers_info.is_empty() {
-            return;
-        }
-        let peer_id = self.connected_peers_info[self.peer_cursor].0.clone();
-        let username = self.connected_peers_info[self.peer_cursor].1.clone();
-        self.select_chat(Some(peer_id.clone()));
-        self.add_system_message(format!("💬 Switched to DM with @{}", username));
-    }
-
-    pub fn switch_to_broadcast(&mut self) {
-        if self.selected_chat.is_some() {
-            self.select_chat(None);
-            self.add_system_message("📢 Switched to Broadcast mode".to_string());
-        }
-    }
 }
 
-/// Runs the TUI event loop. Returns Some(input) when user presses Enter with text.
+// 🚀 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: принимаем &mut App и возвращаем Option<String>
 pub fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<Option<String>> {
     let mut last_tick = std::time::Instant::now();
-    let tick_rate = std::time::Duration::from_millis(200);
+    let tick_rate = std::time::Duration::from_millis(250);
     loop {
         terminal.draw(|f| ui(f, app))?;
         let timeout = tick_rate
@@ -187,44 +148,20 @@ pub fn run_app<B: Backend>(
                             KeyCode::Char('q') => return Ok(Some("/quit".to_string())),
                             KeyCode::Char('e') => {
                                 app.input_mode = InputMode::Editing;
-                                app.status = "✏️ Editing".to_string();
+                                app.status = "✏️ Editing mode / Режим ввода".to_string();
                             }
                             KeyCode::Char('h') => app.show_help = !app.show_help,
                             KeyCode::Char('p') => app.show_peers = !app.show_peers,
                             KeyCode::Up => {
-                                if app.show_peers {
-                                    app.move_peer_cursor(-1);
-                                } else if app.scroll > 0 {
+                                if app.scroll > 0 {
                                     app.scroll -= 1;
                                 }
                             }
                             KeyCode::Down => {
-                                if app.show_peers {
-                                    app.move_peer_cursor(1);
-                                } else {
-                                    app.scroll += 1;
-                                }
+                                app.scroll += 1;
                             }
-                            KeyCode::Tab => {
-                                if app.selected_chat.is_some() {
-                                    app.switch_to_broadcast();
-                                } else if !app.connected_peers_info.is_empty() {
-                                    app.select_peer_at_cursor();
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if app.show_peers && !app.connected_peers_info.is_empty() {
-                                    app.select_peer_at_cursor();
-                                    app.show_peers = false;
-                                }
-                            }
-                            KeyCode::Char('c') => {
-                                if !app.connected_peers_info.is_empty() {
-                                    app.select_peer_at_cursor();
-                                }
-                            }
-                            KeyCode::Char('b') => {
-                                app.switch_to_broadcast();
+                            KeyCode::Char('r') => {
+                                app.status = "🔄 Refreshing...".to_string();
                             }
                             _ => {}
                         },
@@ -233,15 +170,15 @@ pub fn run_app<B: Backend>(
                                 let input = app.input.trim().to_string();
                                 app.input.clear();
                                 app.input_mode = InputMode::Normal;
-                                app.status = "Ready".to_string();
+                                app.status = "Ready / Готов".to_string();
                                 if !input.is_empty() {
-                                    return Ok(Some(input));
+                                    return Ok(Some(input)); // Возвращаем ввод
                                 }
                             }
                             KeyCode::Esc => {
                                 app.input.clear();
                                 app.input_mode = InputMode::Normal;
-                                app.status = "Ready".to_string();
+                                app.status = "Ready / Готов".to_string();
                             }
                             KeyCode::Char(c) => app.input.push(c),
                             KeyCode::Backspace => {
@@ -272,9 +209,8 @@ fn ui(f: &mut Frame, app: &App) {
         ])
         .split(f.size());
 
-    // Title
     let title_text = if app.lan_mode {
-        format!(" LAN MODE — {}", app.username)
+        format!("🏠 LAN MODE — {}", app.username)
     } else {
         format!("🗼 BEACON MODE — {}", app.username)
     };
@@ -310,20 +246,19 @@ fn ui(f: &mut Frame, app: &App) {
     );
     f.render_widget(title, chunks[0]);
 
-    // Info
     let beacon_status = if let Some(ref beacon) = app.beacon_addr {
         format!("🟢 {}", beacon)
     } else {
         "🔴 None (LAN mode)".to_string()
     };
     let info_text = format!(
-        "👤 {} ({})\n📡 {}\n Local: {}\n🌍 External: {} | 🔥 NAT: {}",
+        "👤 {} ({})\n📡 {}\n🏠 Local: {}\n🌍 External: {} | 🔥 NAT: {}",
         app.username,
         app.peer_id_short,
         beacon_status,
         app.local_addrs.join(", "),
         app.external_addr.as_deref().unwrap_or("Unknown"),
-        app.nat_type,
+        app.nat_type
     );
     let info = Paragraph::new(info_text)
         .block(
@@ -335,13 +270,11 @@ fn ui(f: &mut Frame, app: &App) {
         .wrap(Wrap { trim: true });
     f.render_widget(info, chunks[1]);
 
-    // Main content
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(chunks[2]);
 
-    // Chat
     let messages_text: Vec<Line> = app
         .messages
         .iter()
@@ -362,8 +295,8 @@ fn ui(f: &mut Frame, app: &App) {
             };
             let style = if text.contains("🏠") || text.contains("LAN") {
                 Style::default().fg(Color::LightGreen)
-            } else if text.contains("💬") {
-                Style::default().fg(Color::Magenta)
+            } else if text.contains("🗼") || text.contains("beacon") {
+                Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -387,28 +320,18 @@ fn ui(f: &mut Frame, app: &App) {
         .scroll((app.scroll as u16, 0));
     f.render_widget(messages, main_chunks[0]);
 
-    // Peers
     let mut peers_text = String::new();
-    if !app.connected_peers_info.is_empty() {
+    if !app.connected_peers.is_empty() {
         peers_text.push_str(&format!(
             "🌐 Network Peers ({})\n",
-            app.connected_peers_info.len()
+            app.connected_peers.len()
         ));
-        for (i, (peer_id, username)) in app.connected_peers_info.iter().enumerate() {
-            let short_id = if peer_id.len() > 8 {
-                format!("{}...", &peer_id[..8])
-            } else {
-                peer_id.clone()
-            };
-            let marker = if app.selected_chat.as_deref() == Some(peer_id.as_str()) {
-                "▶ "
-            } else if i == app.peer_cursor {
-                "• "
-            } else {
-                "  "
-            };
-            peers_text.push_str(&format!("{}{} (@{})\n", marker, short_id, username));
+        for peer in &app.connected_peers {
+            peers_text.push_str(&format!("  • {}\n", peer));
         }
+    }
+    if app.lan_peer_count > 0 {
+        peers_text.push_str(&format!("\n🏠 LAN Peers ({})\n", app.lan_peer_count));
     }
     if peers_text.is_empty() {
         peers_text = "No peers connected\nНет подключённых пиров".to_string();
@@ -429,7 +352,6 @@ fn ui(f: &mut Frame, app: &App) {
         .wrap(Wrap { trim: true });
     f.render_widget(peers, main_chunks[1]);
 
-    // Input
     let input_style = if app.input_mode == InputMode::Editing {
         Style::default().fg(Color::Yellow)
     } else {
@@ -438,71 +360,46 @@ fn ui(f: &mut Frame, app: &App) {
     let input_label = if app.input_mode == InputMode::Editing {
         " ✏️ Type message (ESC to cancel) "
     } else {
-        " [e]dit [h]elp [p]eers [↑↓]nav [Tab]chat [q]uit "
+        " [e]dit  [h]elp  [p]eers  [r]efresh  [q]uit "
     };
-    let input_title = format!("{} | {}", input_label, app.get_chat_target_label());
     let input = Paragraph::new(app.input.clone()).style(input_style).block(
         Block::default()
-            .title(input_title)
+            .title(input_label)
             .borders(Borders::ALL)
             .border_style(input_style),
     );
     f.render_widget(input, chunks[3]);
 
-    // Status
     let status_text = if app.lan_mode {
         format!(" 🏠 LAN Mode | {}", app.status)
     } else {
         format!(" 🗼 Beacon Mode | {}", app.status)
     };
-    let status =
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(status, chunks[4]);
+    f.render_widget(
+        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        chunks[4],
+    );
 
-    // Help popup
     if app.show_help {
-        let help_text = "\
-🌊 UNDERTOW PROTOCOL — Help\n\
-════════════════════════════════\n\n\
-🎮 Keys:\n\
-  e       — Start writing\n\
-  Enter   — Send\n\
-  ESC     — Cancel\n\
-  h       — Toggle help\n\
-  p       — Toggle peers list\n\
-  ↑,↓     — Scroll chat OR navigate peers\n\
-  Tab     — Switch Broadcast ↔ DM\n\
-  Enter   — (in peers popup) select peer\n\
-  c       — Chat with peer under cursor\n\
-  b       — Back to broadcast mode\n\
-  q       — Quit\n\n\
-📝 Commands:\n\
-  /chat <name>    — Start DM with user\n\
-  /broadcast      — Switch to broadcast\n\
-  /peers          — Show peers list\n\
-  /lan            — Show LAN peers\n\
-  /nat            — Detect NAT\n\
-  /help           — Show this help\n\
-  (text)          — Send message to current chat\n";
-        let area = centered_rect(60, 80, f.size());
-        let help = Paragraph::new(help_text)
-            .block(
-                Block::default()
-                    .title(" Help (press h to close)")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            )
-            .wrap(Wrap { trim: true });
+        let help_text = "🌊 UNDERTOW PROTOCOL — Help\n════════════════════════════════\n\n🎮 Keys:\n  e — Start writing\n  Enter — Send\n  ESC — Cancel\n  h — Toggle help\n  p — Toggle peers\n  ↑,↓ — Scroll chat\n  q — Quit\n\n📝 Commands:\n  /msg <user> <text>\n  /send <id> <text>\n  /peers, /lan, /nat, /help";
+        let area = centered_rect(60, 60, f.size());
         f.render_widget(Clear, area);
-        f.render_widget(help, area);
+        f.render_widget(
+            Paragraph::new(help_text)
+                .block(
+                    Block::default()
+                        .title(" Help (h to close)")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                )
+                .wrap(Wrap { trim: true }),
+            area,
+        );
     }
-
-    // Peers popup
     if app.show_peers {
-        let mut peers_text = String::from("🌐 Connected Peers\n");
-        peers_text.push_str("════════════════════════════════\n\n");
+        let mut p_text = String::from("🌐 Connected Peers\n════════════════════════════════\n\n");
         if app.connected_peers_info.is_empty() {
-            peers_text.push_str("  No peers connected\n");
+            p_text.push_str("  No peers connected\n");
         } else {
             for (i, (peer_id, username)) in app.connected_peers_info.iter().enumerate() {
                 let short_id = if peer_id.len() > 16 {
@@ -510,35 +407,27 @@ fn ui(f: &mut Frame, app: &App) {
                 } else {
                     peer_id.clone()
                 };
-                let marker = if i == app.peer_cursor { "▶" } else { " " };
-                let is_selected = app.selected_chat.as_deref() == Some(peer_id.as_str());
-                let sel_mark = if is_selected { " [DM]" } else { "" };
-                peers_text.push_str(&format!(
-                    "  {} {:<2} @{} ({}){}\n",
-                    marker,
-                    i + 1,
-                    username,
-                    short_id,
-                    sel_mark
-                ));
+                p_text.push_str(&format!("  {:<2} 🏠 @{} ({})\n", i + 1, username, short_id));
             }
         }
-        peers_text.push_str(&format!(
+        p_text.push_str(&format!(
             "\n  Total: {} peers",
             app.connected_peers_info.len()
         ));
-        peers_text.push_str("\n\n  ↑↓ navigate | Enter select | p close");
+        p_text.push_str("\n\n  Press 'p' to close");
         let area = centered_rect(50, 60, f.size());
-        let peers = Paragraph::new(peers_text)
-            .block(
-                Block::default()
-                    .title(" Peers ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Magenta)),
-            )
-            .wrap(Wrap { trim: true });
         f.render_widget(Clear, area);
-        f.render_widget(peers, area);
+        f.render_widget(
+            Paragraph::new(p_text)
+                .block(
+                    Block::default()
+                        .title(" Peers ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Magenta)),
+                )
+                .wrap(Wrap { trim: true }),
+            area,
+        );
     }
 }
 
