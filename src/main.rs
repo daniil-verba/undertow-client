@@ -1,7 +1,16 @@
 //! ## Undertow Client - P2P Node with TUI
+//!
+//! Main entry point for the P2P node with beautiful TUI.
+//!
+//! ## Usage / Использование:
+//! ```bash
+//! cargo run --bin undertow
+//! ```
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -13,16 +22,18 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use undertow_protocol::{
-    beacon::beacon_client::BeaconClient,
-    network::lan_beacon::{LanBeacon, LanEvent},
-    network::{local::LocalDiscovery, nat::NatDetector},
-    protocol::{
-        packet::{Packet, PacketType},
-        peer_id::PeerId,
-    },
-    storage::init_profile,
+// Исправленный импорт: beacon находится на верхнем уровне
+use undertow_protocol::beacon::beacon_client::BeaconClient;
+use undertow_protocol::network::{
+    lan_discovery::{LanDiscovery, LanMessageType},
+    local::LocalDiscovery,
+    nat::NatDetector,
 };
+use undertow_protocol::protocol::{
+    packet::{Packet, PacketType},
+    peer_id::PeerId,
+};
+use undertow_protocol::storage::init_profile;
 
 mod ui;
 use crate::ui::app::{run_app, App};
@@ -30,7 +41,7 @@ use crate::ui::app::{run_app, App};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // === PHASE 0: Load or create profile ===============================
-    let mut profile = init_profile(None)?;
+    let profile = init_profile(None)?;
     let my_peer_id = profile.peer_id();
     let username = profile.username.clone();
 
@@ -46,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::io::stdin().read_line(&mut port_input)?;
     let port: u16 = port_input.trim().parse().unwrap_or(9001);
 
-    print!("🗼 Beacon address [ip:port or 'none']: ");
+    print!("🗼 Beacon address [ip:port, 'none' for LAN only]: ");
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut beacon_input = String::new();
     std::io::stdin().read_line(&mut beacon_input)?;
@@ -65,14 +76,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nat_type_str = format!("{:?}", nat_info.nat_type);
     let external_str = nat_info.external_addr.map(|a| a.to_string());
 
-    // Start TCP server
+    // Start TCP server for incoming connections
     let addr = format!("0.0.0.0:{}", port);
     let _server = tokio::spawn(run_server(addr.clone(), my_peer_id));
 
-    // Connect to beacon with username
+    // === PHASE 2: Setup LAN Discovery ==================================
+    let lan_discovery = LanDiscovery::new(my_peer_id, username.clone(), port).await?;
+
+    // Channel for async messages (UI, LAN, Beacon)
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    // Clone lan_discovery BEFORE moving into the closure
+    let lan_discovery_clone = lan_discovery.clone();
+    let peer_id_clone = my_peer_id.clone();
+    let tx_lan = tx.clone();
+
+    // Start LAN discovery listener
+    tokio::spawn(async move {
+        let _ = lan_discovery_clone
+            .listen(move |msg, addr| {
+                // Ignore our own messages
+                if msg.peer_id == peer_id_clone.to_string() {
+                    return;
+                }
+
+                match msg.msg_type {
+                    LanMessageType::Announce => {
+                        // Found a peer in LAN
+                        let peer_addr = SocketAddr::new(addr.ip(), msg.port);
+                        let _ = tx_lan.send(format!(
+                            "LAN_PEER_FOUND:{}:{}:{}",
+                            msg.peer_id, msg.username, peer_addr
+                        ));
+                    }
+                    LanMessageType::Leave => {
+                        let _ =
+                            tx_lan.send(format!("LAN_PEER_LEFT:{}:{}", msg.peer_id, msg.username));
+                    }
+                }
+            })
+            .await;
+    });
+
+    // Start periodic LAN announcements (clone again)
+    let lan_announce = lan_discovery.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let _ = lan_announce.announce().await;
+        }
+    });
+
+    // Send initial announce (use original)
+    let _ = lan_discovery.announce().await;
+    println!("🏠 LAN Discovery started (announcing every 10s)");
+
+    // === PHASE 3: Connect to Beacon (if specified) =====================
     let mut beacon_client: Option<BeaconClient> = None;
     if let Some(ref beacon) = beacon_addr_opt {
-        match BeaconClient::connect(beacon, my_peer_id, &username).await {
+        match BeaconClient::connect(beacon, my_peer_id).await {
             Ok(client) => {
                 println!("✅ Connected to beacon: {}", beacon);
                 beacon_client = Some(client);
@@ -83,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // === PHASE 2: TUI =================================================
+    // === PHASE 4: TUI Setup ============================================
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -102,36 +165,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     app.add_system_message(format!(
-        "Node started on port {} | ID: {}",
+        "🚀 Node started on port {} | ID: {}",
         port,
         my_peer_id.short()
     ));
 
-    if let Some(ref beacon) = beacon_addr_opt {
+    if beacon_addr_opt.is_some() {
         if beacon_client.is_some() {
-            app.add_system_message(format!("Connected to beacon: {}", beacon));
+            app.add_system_message("🗼 Connected to beacon".to_string());
         } else {
-            app.add_system_message(format!("Beacon connection failed: {}", beacon));
+            app.add_system_message("⚠️ Beacon connection failed".to_string());
         }
+    } else {
+        app.add_system_message("🏠 LAN mode: beacon not used".to_string());
+        app.add_system_message("🔍 Searching for peers in local network...".to_string());
     }
 
-    // === PHASE 3: LAN Beacon Setup =====================================
-    let peer_id_bytes = *my_peer_id.as_bytes();
-    let lan_beacon = Arc::new(LanBeacon::new(peer_id_bytes, username.clone(), port).await?);
-
-    let (lan_tx, mut lan_rx) = mpsc::unbounded_channel::<LanEvent>();
-
-    lan_beacon.start(lan_tx.clone()).await;
-
-    app.lan_beacon = Some(lan_beacon.clone());
-    app.add_system_message("🌐 LAN beacon started on port 9003".to_string());
-
-    // Channel for async messages
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-
-    // Spawn beacon receiver
+    // === PHASE 5: Beacon message receiver ==============================
     if let Some(mut client) = beacon_client {
-        let tx_clone = tx.clone();
+        let tx_beacon = tx.clone();
         tokio::spawn(async move {
             loop {
                 match client.receive_packet().await {
@@ -140,13 +192,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(sender) = packet.message_sender() {
                                 if let Some(content) = packet.message_content() {
                                     let text = String::from_utf8_lossy(content).to_string();
-                                    let _ = tx_clone.send(format!("MSG:{}:{}", sender, text));
+                                    let _ = tx_beacon.send(format!("MSG:{}:{}", sender, text));
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx_clone.send(format!("ERR:Beacon read error: {}", e));
+                        let _ = tx_beacon.send(format!("ERR:Beacon read error: {}", e));
                         break;
                     }
                 }
@@ -154,30 +206,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Reconnect beacon for sending
-    let mut beacon_client: Option<BeaconClient> = None;
+    // Reconnect beacon for sending (separate connection)
+    let mut beacon_sender: Option<BeaconClient> = None;
     if let Some(ref beacon) = beacon_addr_opt {
-        if let Ok(client) = BeaconClient::connect(beacon, my_peer_id, &username).await {
-            beacon_client = Some(client);
+        if let Ok(client) = BeaconClient::connect(beacon, my_peer_id).await {
+            beacon_sender = Some(client);
         }
     }
 
-    // Main loop
+    // === PHASE 6: Main TUI Loop =========================================
+    let mut lan_peers: HashMap<String, String> = HashMap::new();
+
     loop {
-        // === PROCESS MESSAGES FROM BEACON ===
+        // Process pending messages
         while let Ok(msg) = rx.try_recv() {
             if msg.starts_with("MSG:") {
                 let parts: Vec<&str> = msg[4..].splitn(2, ':').collect();
                 if parts.len() == 2 {
-                    let content = parts[1];
+                    let sender = parts[0].to_string();
+                    let content = parts[1].to_string();
+
+                    // Check for system messages from Beacon
                     if content.starts_with("PEER_LIST:") {
                         let list_data = &content[10..];
                         if !list_data.is_empty() {
                             let mut peers = Vec::new();
                             for entry in list_data.split(';') {
-                                let parts: Vec<&str> = entry.splitn(2, ':').collect();
-                                if parts.len() == 2 {
-                                    peers.push((parts[0].to_string(), parts[1].to_string()));
+                                let peer_parts: Vec<&str> = entry.splitn(2, ':').collect();
+                                if peer_parts.len() == 2 {
+                                    let peer_id = peer_parts[0].to_string();
+                                    let username = peer_parts[1].to_string();
+                                    if peer_id != my_peer_id.to_string() {
+                                        peers.push((peer_id, username));
+                                    }
                                 }
                             }
                             app.update_peers(peers);
@@ -191,12 +252,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if parts.len() == 2 {
                             let peer_id = parts[0].to_string();
                             let username = parts[1].to_string();
-                            app.add_peer(peer_id.clone(), username.clone());
-                            app.add_system_message(format!(
-                                "👤 {} ({}) joined the network",
-                                username,
-                                &peer_id[..8]
-                            ));
+                            if peer_id != my_peer_id.to_string() {
+                                app.add_peer(peer_id.clone(), username.clone());
+                                app.add_system_message(format!(
+                                    "👤 {} joined the network",
+                                    username
+                                ));
+                            }
                         }
                     } else if content.starts_with("PEER_LEFT:") {
                         let parts: Vec<&str> = content[10..].splitn(2, ':').collect();
@@ -204,255 +266,302 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let peer_id = parts[0].to_string();
                             let username = parts[1].to_string();
                             app.remove_peer(&peer_id);
-                            app.add_system_message(format!(
-                                "👋 {} ({}) left the network",
-                                username,
-                                &peer_id[..8]
-                            ));
+                            app.add_system_message(format!("👋 {} left the network", username));
                         }
                     } else {
-                        app.add_message(parts[0].to_string(), content.to_string());
+                        // Regular message
+                        app.add_message(sender, content);
                     }
+                }
+            } else if msg.starts_with("LAN_PEER_FOUND:") {
+                let parts: Vec<&str> = msg[15..].splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    let peer_id = parts[0].to_string();
+                    let username = parts[1].to_string();
+                    let addr = parts[2].to_string();
+
+                    // Store LAN peer
+                    lan_peers.insert(peer_id.clone(), addr.clone());
+                    app.set_lan_peer_count(lan_peers.len());
+
+                    // Add to UI if not already present
+                    if !app
+                        .connected_peers_info
+                        .iter()
+                        .any(|(id, _)| id == &peer_id)
+                    {
+                        app.add_peer(peer_id.clone(), username.clone());
+                        app.add_system_message(format!(
+                            "🏠 LAN peer found: {} ({}) at {}",
+                            username,
+                            &peer_id[..8],
+                            addr
+                        ));
+                    }
+                }
+            } else if msg.starts_with("LAN_PEER_LEFT:") {
+                let parts: Vec<&str> = msg[14..].splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    let peer_id = parts[0].to_string();
+                    let username = parts[1].to_string();
+                    app.remove_peer(&peer_id);
+                    lan_peers.remove(&peer_id);
+                    app.set_lan_peer_count(lan_peers.len());
+                    app.add_system_message(format!(
+                        "🏠 LAN peer left: {} ({})",
+                        username,
+                        &peer_id[..8]
+                    ));
                 }
             } else if msg.starts_with("ERR:") {
                 app.add_system_message(msg[4..].to_string());
             }
         }
 
-        // === PROCESS LAN EVENTS ===
-        while let Ok(event) = lan_rx.try_recv() {
-            match event {
-                LanEvent::PeerJoined {
-                    peer_id,
-                    username,
-                    addr,
-                } => {
-                    let peer_id_hex = hex::encode(&peer_id);
-                    app.add_lan_peer(peer_id_hex.clone(), username.clone());
-                    app.add_system_message(format!(
-                        "🌐 LAN: {} (@{}) joined from {}",
-                        username,
-                        &peer_id_hex[..8],
-                        addr
-                    ));
-                }
-                LanEvent::PeerLeft { peer_id, username } => {
-                    let peer_id_hex = hex::encode(&peer_id);
-                    app.remove_lan_peer(&peer_id_hex);
-                    app.add_system_message(format!(
-                        "🌐 LAN: {} (@{}) left",
-                        username,
-                        &peer_id_hex[..8]
-                    ));
-                }
-                LanEvent::ChatMessage {
-                    sender_id,
-                    sender_name,
-                    content,
-                } => {
-                    let sender_hex = hex::encode(&sender_id);
-                    app.add_message(sender_hex, format!("[LAN] {}", content));
-                    app.add_system_message(format!("💬 LAN from {}: {}", sender_name, content));
-                }
-            }
-        }
+        // Run UI and get input
+        let input = run_app(&mut terminal, app)?;
 
-        // === RUN TUI ===
-        let (input, new_app) = run_app(&mut terminal, app)?;
-        app = new_app;
+        // Recreate app with preserved state
+        app = App::new(
+            my_peer_id.to_string(),
+            username.clone(),
+            local_addr_strs.clone(),
+            external_str.clone(),
+            nat_type_str.clone(),
+            beacon_addr_opt.clone(),
+        );
+        // Restore LAN peer count
+        app.set_lan_peer_count(lan_peers.len());
 
         if input == "/quit" {
+            // Send leave notification before quitting
+            let _ = lan_discovery.leave().await;
             break;
         }
 
-        // === HANDLE COMMANDS ===
+        // === PHASE 7: Command Handling =================================
         if input == "/help" || input == "help" {
             app.show_help = true;
             continue;
         } else if input == "/peers" {
-            if let Some(ref mut _client) = beacon_client {
-                app.add_system_message("Peer list requested (not implemented yet)".to_string());
-            } else {
-                app.add_system_message("Not connected to beacon".to_string());
-            }
-            continue;
-        } else if input == "/name" {
-            app.start_change_name();
-            continue;
-        } else if input.starts_with("/name ") {
-            let new_name = input[6..].trim().to_string();
-            if !new_name.is_empty() && new_name.len() <= 32 {
-                match profile.update_username(new_name.clone()) {
-                    Ok(()) => {
-                        app.username = new_name.clone();
-                        app.add_system_message(format!("✅ Username changed to: {}", new_name));
-                        lan_beacon.update_username(new_name).await;
-                    }
-                    Err(e) => {
-                        app.add_system_message(format!("❌ Failed to change name: {}", e));
-                    }
-                }
-            } else {
-                app.add_system_message("❌ Invalid username (must be 1-32 characters)".to_string());
-            }
-            continue;
-        } else if input == "/lan" {
-            let peers = lan_beacon.get_active_peers().await;
-            if peers.is_empty() {
-                app.add_system_message("🌐 No LAN peers found".to_string());
-            } else {
-                app.add_system_message(format!("🌐 LAN peers ({}):", peers.len()));
-                for peer in peers {
-                    app.add_system_message(format!(
-                        "  🟢 {} (@{})",
-                        peer.username,
-                        hex::encode(&peer.peer_id)[..8].to_string()
-                    ));
-                }
-            }
-            continue;
-        } else if input.starts_with("/msg-lan ") {
-            let parts: Vec<&str> = input[9..].splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let target_name = parts[0];
-                let content = parts[1];
-
-                let peers = lan_beacon.get_active_peers().await;
-                if let Some(peer) = peers.iter().find(|p| p.username == target_name) {
-                    match lan_beacon
-                        .send_chat_message(peer.peer_id, content.to_string())
-                        .await
-                    {
+            if beacon_sender.is_some() {
+                // Request peer list from beacon
+                let packet = Packet::message(&my_peer_id, &my_peer_id, b"GET_PEERS".as_ref());
+                if let Some(ref mut client) = beacon_sender {
+                    match client.send_packet(&packet).await {
                         Ok(_) => {
-                            app.add_system_message(format!(
-                                "📤 LAN message sent to {}: {}",
-                                target_name, content
-                            ));
-                            app.add_message(
-                                app.peer_id.clone(),
-                                format!("[→ LAN @{}] {}", target_name, content),
+                            app.add_system_message(
+                                "📋 Requesting peer list from beacon...".to_string(),
                             );
                         }
                         Err(e) => {
-                            app.add_system_message(format!("❌ Failed to send LAN message: {}", e));
+                            app.add_system_message(format!("❌ Failed to request peers: {}", e));
                         }
                     }
+                }
+            } else {
+                // Show LAN peers
+                if lan_peers.is_empty() {
+                    app.add_system_message("🏠 No LAN peers found".to_string());
                 } else {
-                    app.add_system_message(format!("❌ Peer not found in LAN: {}", target_name));
-                }
-            } else {
-                app.add_system_message("Usage: /msg-lan <username> <message>".to_string());
-            }
-            continue;
-        } else if input.starts_with("/broadcast") {
-            let content = if input.len() > 10 {
-                input[10..].trim()
-            } else {
-                app.add_system_message(
-                    "💡 Type /broadcast <message> to send to all LAN peers".to_string(),
-                );
-                continue;
-            };
-
-            if !content.is_empty() {
-                match lan_beacon.broadcast_chat_message(content.to_string()).await {
-                    Ok(_) => {
-                        app.add_system_message("📢 Broadcast sent to all LAN peers".to_string());
-                        app.add_message(app.peer_id.clone(), format!("[📢 BROADCAST] {}", content));
-                    }
-                    Err(e) => {
-                        app.add_system_message(format!("❌ Failed to broadcast: {}", e));
+                    app.add_system_message(format!("🏠 LAN peers: {}", lan_peers.len()));
+                    for (_id, addr) in &lan_peers {
+                        // _id вместо id
+                        app.add_system_message(format!("  • {}", addr));
                     }
                 }
             }
-            continue;
         } else if input.starts_with("/msg ") {
             let parts: Vec<&str> = input[5..].splitn(2, ' ').collect();
             if parts.len() == 2 {
                 let target_username = parts[0];
                 let message = parts[1];
 
-                if let Some(ref mut client) = beacon_client {
-                    match client.send_to_username(target_username, message).await {
-                        Ok(_) => {
-                            app.add_system_message(format!(
-                                "Sent to @{}: {}",
-                                target_username, message
-                            ));
-                            app.add_message(
-                                my_peer_id.to_string(),
-                                format!("[→ @{}] {}", target_username, message),
+                // Try to find peer by username
+                let mut target_peer_id = None;
+                let mut target_addr = None;
+
+                // Check LAN peers
+                for (id, addr) in &lan_peers {
+                    // Check if this peer matches the username
+                    if let Some(peer_info) = app
+                        .connected_peers_info
+                        .iter()
+                        .find(|(_, name)| name == target_username)
+                    {
+                        target_peer_id = Some(peer_info.0.clone());
+                        target_addr = Some(addr.clone());
+                        break;
+                    }
+                }
+
+                // Also check network peers from beacon
+                if target_peer_id.is_none() {
+                    if let Some(peer_info) = app
+                        .connected_peers_info
+                        .iter()
+                        .find(|(_, name)| name == target_username)
+                    {
+                        target_peer_id = Some(peer_info.0.clone());
+                    }
+                }
+
+                if let Some(peer_id_str) = target_peer_id {
+                    // Try to parse PeerId
+                    if let Ok(peer_id) = PeerId::from_hex(&peer_id_str) {
+                        // Try LAN direct delivery first
+                        if let Some(addr) = target_addr {
+                            match send_direct_message(&addr, &my_peer_id, &peer_id, message).await {
+                                Ok(_) => {
+                                    app.add_system_message(format!(
+                                        "✅ Sent to @{} via LAN",
+                                        target_username
+                                    ));
+                                    app.add_message(
+                                        my_peer_id.to_string(),
+                                        format!("[→ @{}] {}", target_username, message),
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    app.add_system_message(format!(
+                                        "⚠️ LAN send failed: {}, trying beacon...",
+                                        e
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Fallback to beacon
+                        if let Some(ref mut client) = beacon_sender {
+                            let payload = format!("TO:{}:{}", target_username, message);
+                            let packet =
+                                Packet::message(&my_peer_id, &my_peer_id, payload.as_bytes());
+                            match client.send_packet(&packet).await {
+                                Ok(_) => {
+                                    app.add_system_message(format!(
+                                        "✅ Sent to @{} via beacon",
+                                        target_username
+                                    ));
+                                    app.add_message(
+                                        my_peer_id.to_string(),
+                                        format!("[→ @{}] {}", target_username, message),
+                                    );
+                                }
+                                Err(e) => {
+                                    app.add_system_message(format!("❌ Send failed: {}", e));
+                                }
+                            }
+                        } else {
+                            app.add_system_message(
+                                "❌ No beacon connection and LAN delivery failed".to_string(),
                             );
                         }
-                        Err(e) => {
-                            app.add_system_message(format!("Send failed: {}", e));
-                        }
+                    } else {
+                        app.add_system_message(format!(
+                            "❌ Invalid PeerId for user '{}'",
+                            target_username
+                        ));
                     }
                 } else {
-                    app.add_system_message("Not connected to beacon".to_string());
+                    app.add_system_message(format!("❌ User '{}' not found", target_username));
                 }
             } else {
                 app.add_system_message("Usage: /msg <username> <message>".to_string());
             }
-            continue;
         } else if input.starts_with("/send ") {
             let parts: Vec<&str> = input[6..].splitn(2, ' ').collect();
             if parts.len() == 2 {
                 match PeerId::from_hex(parts[0]) {
                     Ok(recipient) => {
-                        let packet = Packet::message(&my_peer_id, &recipient, parts[1].as_bytes());
-                        if let Some(ref mut client) = beacon_client {
-                            match client.send_packet(&packet).await {
-                                Ok(_) => {
-                                    app.add_system_message(format!(
-                                        "Sent to {}: {}",
-                                        recipient.short(),
-                                        parts[1]
-                                    ));
-                                    app.add_message(
-                                        my_peer_id.to_string(),
-                                        format!("[→ {}] {}", recipient.short(), parts[1]),
-                                    );
-                                }
-                                Err(e) => {
-                                    app.add_system_message(format!("Send failed: {}", e));
+                        let recipient_str = recipient.to_string();
+                        let mut sent = false;
+
+                        // Try LAN first
+                        for (id, addr) in &lan_peers {
+                            if id == &recipient_str {
+                                match send_direct_message(addr, &my_peer_id, &recipient, parts[1])
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        app.add_system_message(format!(
+                                            "✅ Sent to {} via LAN",
+                                            recipient.short()
+                                        ));
+                                        app.add_message(
+                                            my_peer_id.to_string(),
+                                            format!("[→ {}] {}", recipient.short(), parts[1]),
+                                        );
+                                        sent = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        app.add_system_message(format!(
+                                            "⚠️ LAN send failed: {}",
+                                            e
+                                        ));
+                                    }
                                 }
                             }
-                        } else {
-                            app.add_system_message("Not connected to beacon".to_string());
+                        }
+
+                        // Fallback to beacon
+                        if !sent {
+                            if let Some(ref mut client) = beacon_sender {
+                                let packet =
+                                    Packet::message(&my_peer_id, &recipient, parts[1].as_bytes());
+                                match client.send_packet(&packet).await {
+                                    Ok(_) => {
+                                        app.add_system_message(format!(
+                                            "✅ Sent to {} via beacon",
+                                            recipient.short()
+                                        ));
+                                        app.add_message(
+                                            my_peer_id.to_string(),
+                                            format!("[→ {}] {}", recipient.short(), parts[1]),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        app.add_system_message(format!("❌ Send failed: {}", e));
+                                    }
+                                }
+                            } else {
+                                app.add_system_message(
+                                    "❌ No beacon connection and LAN delivery failed".to_string(),
+                                );
+                            }
                         }
                     }
                     Err(e) => {
-                        app.add_system_message(format!("Invalid PeerId: {}", e));
+                        app.add_system_message(format!("❌ Invalid PeerId: {}", e));
                     }
                 }
             } else {
                 app.add_system_message("Usage: /send <peer_id> <message>".to_string());
             }
-            continue;
         } else if input == "/nat" {
             let nat = NatDetector::detect(port).await;
             app.add_system_message(format!(
                 "NAT: {:?} | External: {:?}",
                 nat.nat_type, nat.external_addr
             ));
-            continue;
         } else if input.starts_with("/ping ") {
             let target = input[6..].trim();
             match send_ping(target).await {
-                Ok(_) => app.add_system_message(format!("Ping OK: {}", target)),
-                Err(e) => app.add_system_message(format!("Ping failed: {}", e)),
+                Ok(_) => app.add_system_message(format!("✅ Ping OK: {}", target)),
+                Err(e) => app.add_system_message(format!("❌ Ping failed: {}", e)),
             }
-            continue;
-        } else if !input.is_empty() && !input.starts_with('/') {
-            app.add_system_message(format!("Unknown command: {}", input));
+        } else if input == "/lan" {
+            app.add_system_message(format!("🏠 LAN peers: {}", lan_peers.len()));
+            for (id, addr) in &lan_peers {
+                app.add_system_message(format!("  • {} at {}", &id[..8], addr));
+            }
+        } else if !input.starts_with('/') {
+            app.add_system_message(format!("❌ Unknown command: {}", input));
         }
     }
 
-    // === CLEANUP ===
-    lan_beacon.stop().await;
-    app.add_system_message("🌐 LAN beacon stopped".to_string());
-
+    // Cleanup
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -462,6 +571,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.show_cursor()?;
 
     println!("\n👋 Goodbye!");
+    Ok(())
+}
+
+/// Send a direct message via TCP (LAN)
+async fn send_direct_message(
+    addr: &str,
+    from: &PeerId,
+    to: &PeerId,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    let packet = Packet::message(from, to, message.as_bytes());
+    let bytes = packet.serialize();
+
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(&bytes).await?;
+
     Ok(())
 }
 
@@ -476,6 +605,8 @@ async fn run_server(addr: String, _my_id: PeerId) {
             return;
         }
     };
+
+    println!("📡 TCP server listening on {}", addr);
 
     loop {
         let (mut stream, peer_addr) = match listener.accept().await {
@@ -504,7 +635,7 @@ async fn run_server(addr: String, _my_id: PeerId) {
                                     if let Some(content) = packet.message_content() {
                                         let text = String::from_utf8_lossy(content);
                                         println!(
-                                            "💬 [{}] Message from {}: {}",
+                                            "💬 [{}] Direct message from {}: {}",
                                             peer_addr,
                                             sender.short(),
                                             text

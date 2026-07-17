@@ -13,8 +13,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::sync::Arc;
-use undertow_protocol::network::lan_beacon::LanBeacon;
 
 /// Application state / Состояние приложения
 pub struct App {
@@ -32,6 +30,8 @@ pub struct App {
     pub nat_type: String,
     /// Connected beacon address / Адрес подключённого маяка
     pub beacon_addr: Option<String>,
+    /// LAN mode flag / Флаг LAN режима
+    pub lan_mode: bool,
     /// Chat messages: (sender_short, sender_full, text_with_time)
     pub messages: Vec<(String, String, String)>,
     /// Input buffer / Буфер ввода
@@ -44,18 +44,16 @@ pub struct App {
     pub connected_peers: Vec<String>,
     /// Connected peers with usernames / Подключённые пиры с именами
     pub connected_peers_info: Vec<(String, String)>, // (peer_id, username)
+    /// LAN peers count / Количество LAN пиров
+    pub lan_peer_count: usize,
     /// Status message / Статусное сообщение
     pub status: String,
     /// Show help popup / Показать всплывающую справку
     pub show_help: bool,
-    /// LAN peers
-    pub lan_peers: Vec<(String, String)>, // (peer_id, username)
-    /// LAN beacon reference (optional)
-    pub lan_beacon: Option<Arc<LanBeacon>>,
-    /// Change name mode
-    pub changing_name: bool,
-    /// New name buffer
-    pub new_name: String,
+    /// Show peers popup / Показать список пиров
+    pub show_peers: bool,
+    /// Mode indicator / Индикатор режима
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +73,8 @@ impl App {
         beacon_addr: Option<String>,
     ) -> Self {
         let peer_id_short = peer_id.chars().take(8).collect();
+        let lan_mode = beacon_addr.is_none();
+        let mode = if lan_mode { "🏠 LAN" } else { "🗼 Beacon" };
 
         Self {
             peer_id,
@@ -84,18 +84,18 @@ impl App {
             external_addr,
             nat_type,
             beacon_addr,
+            lan_mode,
             messages: Vec::new(),
             input: String::new(),
             input_mode: InputMode::Normal,
             scroll: 0,
             connected_peers: Vec::new(),
             connected_peers_info: Vec::new(),
+            lan_peer_count: 0,
             status: "Ready / Готов".to_string(),
             show_help: false,
-            lan_peers: Vec::new(),
-            lan_beacon: None,
-            changing_name: false,
-            new_name: String::new(),
+            show_peers: false,
+            mode: mode.to_string(),
         }
     }
 
@@ -139,6 +139,7 @@ impl App {
         self.connected_peers_info.retain(|(id, _)| id != peer_id);
         self.connected_peers.retain(|p| !p.contains(peer_id));
     }
+
     /// Updates peer list from beacon info.
     pub fn update_peers(&mut self, peers: Vec<(String, String)>) {
         self.connected_peers.clear();
@@ -148,60 +149,19 @@ impl App {
         }
     }
 
-    /// Updates LAN peers list
-    pub fn update_lan_peers(&mut self, peers: Vec<(String, String)>) {
-        self.lan_peers = peers;
+    /// Sets LAN peer count.
+    pub fn set_lan_peer_count(&mut self, count: usize) {
+        self.lan_peer_count = count;
     }
 
-    /// Adds a LAN peer
-    pub fn add_lan_peer(&mut self, peer_id: String, username: String) {
-        if !self.lan_peers.iter().any(|(id, _)| id == &peer_id) {
-            self.lan_peers.push((peer_id, username));
-        }
-    }
-
-    /// Removes a LAN peer
-    pub fn remove_lan_peer(&mut self, peer_id: &str) {
-        self.lan_peers.retain(|(id, _)| id != peer_id);
-    }
-
-    /// Starts changing name mode
-    pub fn start_change_name(&mut self) {
-        self.changing_name = true;
-        self.new_name = self.username.clone();
-        self.input_mode = InputMode::Editing;
-        self.status = "Enter new username (ESC to cancel, Enter to confirm)".to_string();
-    }
-
-    /// Confirms name change
-    pub fn confirm_name_change(&mut self) -> Result<(), String> {
-        let new_name = self.new_name.trim();
-        if new_name.is_empty() {
-            return Err("Username cannot be empty".to_string());
-        }
-        if new_name.len() > 32 {
-            return Err("Username too long (max 32 chars)".to_string());
-        }
-
-        // Обновляем имя в профиле
-        // Это будет делаться в main.rs
-        self.status = format!("Username changed to: {}", new_name);
-        self.changing_name = false;
-        self.input_mode = InputMode::Normal;
-        Ok(())
-    }
-
-    /// Cancels name change
-    pub fn cancel_name_change(&mut self) {
-        self.changing_name = false;
-        self.new_name.clear();
-        self.input_mode = InputMode::Normal;
-        self.status = "Name change cancelled".to_string();
+    /// Returns total connected peers count.
+    pub fn total_peers(&self) -> usize {
+        self.connected_peers.len()
     }
 }
 
 /// Runs the TUI event loop.
-pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(String, App)> {
+pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<String> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = std::time::Duration::from_millis(250);
 
@@ -217,18 +177,22 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                 if key.kind == KeyEventKind::Press {
                     match app.input_mode {
                         InputMode::Normal => match key.code {
-                            KeyCode::Char('q') => return Ok(("/quit".to_string(), app)),
+                            KeyCode::Char('q') => return Ok("/quit".to_string()),
                             KeyCode::Char('e') => {
                                 app.input_mode = InputMode::Editing;
-                                app.status = "Editing mode / Режим ввода".to_string();
+                                app.status = "✏️ Editing mode / Режим ввода".to_string();
                             }
                             KeyCode::Char('h') => app.show_help = !app.show_help,
+                            KeyCode::Char('p') => app.show_peers = !app.show_peers,
                             KeyCode::Up => {
                                 if app.scroll > 0 {
                                     app.scroll -= 1;
                                 }
                             }
                             KeyCode::Down => app.scroll += 1,
+                            KeyCode::Char('r') => {
+                                app.status = "🔄 Refreshing...".to_string();
+                            }
                             _ => {}
                         },
                         InputMode::Editing => match key.code {
@@ -238,7 +202,7 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                                 app.input_mode = InputMode::Normal;
                                 app.status = "Ready / Готов".to_string();
                                 if !input.is_empty() {
-                                    return Ok((input, app));
+                                    return Ok(input);
                                 }
                             }
                             KeyCode::Esc => {
@@ -270,7 +234,7 @@ fn ui(f: &mut Frame, app: &App) {
         .margin(1)
         .constraints([
             Constraint::Length(3), // Title
-            Constraint::Length(8), // Info panel
+            Constraint::Length(6), // Info panel
             Constraint::Min(10),   // Main content
             Constraint::Length(3), // Input
             Constraint::Length(1), // Status
@@ -278,20 +242,34 @@ fn ui(f: &mut Frame, app: &App) {
         .split(f.size());
 
     // === TITLE BAR ===
+    let title_text = if app.lan_mode {
+        format!("🏠 LAN MODE — {}", app.username)
+    } else {
+        format!("🗼 BEACON MODE — {}", app.username)
+    };
+
+    let title_color = if app.lan_mode {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+
     let title = Paragraph::new(Text::from(vec![Line::from(vec![
         Span::styled(" 🌊 ", Style::default().fg(Color::Cyan)),
         Span::styled(
-            "UNDERTOW PROTOCOL",
+            "UNDERTOW",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" — {} ", app.username),
-            Style::default().fg(Color::LightGreen),
+            format!(" — {} ", title_text),
+            Style::default()
+                .fg(title_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "— Decentralized P2P Messenger",
+            format!("(Peers: {})", app.total_peers() + app.lan_peer_count),
             Style::default().fg(Color::Gray),
         ),
     ])]))
@@ -304,18 +282,23 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(title, chunks[0]);
 
     // === INFO PANEL ===
+    let beacon_status = if let Some(ref beacon) = app.beacon_addr {
+        format!("🟢 {}", beacon)
+    } else {
+        "🔴 None (LAN mode)".to_string()
+    };
+
     let info_text = format!(
         "👤 {} ({})\n\
+         📡 {}\n\
          🏠 Local: {}\n\
-         🌍 External: {}\n\
-         🔥 NAT: {} | 🗼 Beacon: {} | 📡 Peers: {}",
+         🌍 External: {} | 🔥 NAT: {}",
         app.username,
         app.peer_id_short,
+        beacon_status,
         app.local_addrs.join(", "),
         app.external_addr.as_deref().unwrap_or("Unknown"),
         app.nat_type,
-        app.beacon_addr.as_deref().unwrap_or("None"),
-        app.connected_peers.len(),
     );
 
     let info = Paragraph::new(info_text)
@@ -348,15 +331,27 @@ fn ui(f: &mut Frame, app: &App) {
             };
             let prefix = if short == &app.username || short == &app.peer_id_short {
                 "You"
+            } else if short == "SYS" {
+                "SYS"
             } else {
                 short
             };
+
+            // Check if this is a system message with emoji indicators
+            let style = if text.contains("🏠") || text.contains("LAN") {
+                Style::default().fg(Color::LightGreen)
+            } else if text.contains("🗼") || text.contains("beacon") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
             Line::from(vec![
                 Span::styled(
                     format!("{} ", prefix),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(text.clone(), Style::default().fg(Color::White)),
+                Span::styled(text.clone(), style),
             ])
         })
         .collect();
@@ -364,7 +359,7 @@ fn ui(f: &mut Frame, app: &App) {
     let messages = Paragraph::new(Text::from(messages_text))
         .block(
             Block::default()
-                .title(" Chat ")
+                .title(format!(" Chat [{}] ", app.messages.len()))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -372,63 +367,42 @@ fn ui(f: &mut Frame, app: &App) {
         .scroll((app.scroll as u16, 0));
     f.render_widget(messages, main_chunks[0]);
 
-    // Peers list with usernames
-    // В функции ui() найти эту секцию:
-    // Peers list with usernames
-    let peers_text = if app.connected_peers.is_empty() {
-        "No peers connected".to_string()
-    } else {
-        app.connected_peers.join("\n")
-    };
-
-    let peers = Paragraph::new(peers_text)
-        .block(
-            Block::default()
-                .title(format!(" Peers [{}] ", app.connected_peers.len()))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(peers, main_chunks[1]);
-
-    // И ЗАМЕНИТЬ её на:
-
-    // Peers list with usernames (LAN + Beacon)
+    // Peers list with indicators
     let mut peers_text = String::new();
 
-    // LAN Peers
-    if !app.lan_peers.is_empty() {
-        peers_text.push_str("🌐 LAN Peers:\n");
-        for (id, username) in &app.lan_peers {
-            let short_id = if id.len() > 8 {
-                format!("{}...", &id[..8])
-            } else {
-                id.clone()
-            };
-            peers_text.push_str(&format!("  🟢 {} (@{})\n", short_id, username));
+    if !app.connected_peers.is_empty() {
+        peers_text.push_str(&format!(
+            "🌐 Network Peers ({})\n",
+            app.connected_peers.len()
+        ));
+        for peer in &app.connected_peers {
+            peers_text.push_str(&format!("  • {}\n", peer));
         }
-        peers_text.push_str("\n");
     }
 
-    // Beacon Peers
-    if !app.connected_peers.is_empty() {
-        peers_text.push_str("📡 Beacon Peers:\n");
+    if app.lan_peer_count > 0 {
+        peers_text.push_str(&format!("\n🏠 LAN Peers ({})\n", app.lan_peer_count));
+        // LAN peers are shown with green indicator
         for peer in &app.connected_peers {
-            peers_text.push_str(&format!("  {}\n", peer));
+            if peer.contains("LAN") || peer.contains("🏠") {
+                peers_text.push_str(&format!("  🟢 {}\n", peer));
+            }
         }
     }
 
     if peers_text.is_empty() {
-        peers_text = "No peers connected".to_string();
+        peers_text = "No peers connected\nНет подключённых пиров".to_string();
+        if app.lan_mode {
+            peers_text.push_str("\n🔍 Searching LAN...");
+        }
     }
 
     let peers = Paragraph::new(peers_text)
         .block(
             Block::default()
                 .title(format!(
-                    " Peers [LAN: {}, Beacon: {}] ",
-                    app.lan_peers.len(),
-                    app.connected_peers.len()
+                    " Peers [{}] ",
+                    app.total_peers() + app.lan_peer_count
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta)),
@@ -444,9 +418,9 @@ fn ui(f: &mut Frame, app: &App) {
     };
 
     let input_label = if app.input_mode == InputMode::Editing {
-        " Send message (ESC=Cancel) "
+        " ✏️ Type message (ESC to cancel) "
     } else {
-        " 'e'=write, 'h'=help, 'q'=quit "
+        " [e]dit  [h]elp  [p]eers  [r]efresh  [q]uit "
     };
 
     let input = Paragraph::new(app.input.clone()).style(input_style).block(
@@ -458,45 +432,107 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(input, chunks[3]);
 
     // === STATUS BAR ===
-    let status = Paragraph::new(format!(" {} ", app.status))
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let status_text = if app.lan_mode {
+        format!(" 🏠 LAN Mode | {}", app.status)
+    } else {
+        format!(" 🗼 Beacon Mode | {}", app.status)
+    };
+    let status =
+        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(status, chunks[4]);
 
     // === HELP POPUP ===
     if app.show_help {
         let help_text = "\
-        🌊 UNDERTOW PROTOCOL — Help\n\n\
-        Keys:\n\
-          e       — Start writing\n\
-          Enter   — Send\n\
-          ESC     — Cancel\n\
-          h       — Toggle help\n\
-          ↑,↓     — Scroll chat\n\
-          q       — Quit\n\n\
-        Commands:\n\
-          /name <username>      — Change your username\n\
-          /lan                  — Show LAN peers\n\
-          /msg-lan <name> <msg> — Send message to LAN peer\n\
-          /broadcast <msg>      — Broadcast to all LAN peers\n\
-          /msg <username> <msg> — Send via beacon\n\
-          /send <peer_id> <msg> — Send by PeerId\n\
-          /peers                — List connected peers\n\
-          /ping <addr>          — Ping node\n\
-          /nat                  — Detect NAT\n\
-          /help                 — Show this help\n\
+        🌊 UNDERTOW PROTOCOL — Help / Справка\n\
+        ════════════════════════════════════════════\n\n\
+        🎮 Keys / Клавиши:\n\
+          e       — Start writing / Начать ввод\n\
+          Enter   — Send / Отправить\n\
+          ESC     — Cancel / Отмена\n\
+          h       — Toggle help / Переключить справку\n\
+          p       — Toggle peers / Список пиров\n\
+          ↑,↓     — Scroll chat / Прокрутка чата\n\
+          r       — Refresh / Обновить\n\
+          q       — Quit / Выход\n\n\
+        📝 Commands / Команды:\n\
+          /msg <username> <text>  — Send to user by name\n\
+          /send <peer_id> <text>  — Send by PeerId\n\
+          /peers                  — List all peers\n\
+          /lan                    — Show LAN peers only\n\
+          /ping <addr>            — Ping node\n\
+          /nat                    — Detect NAT\n\
+          /help                   — Show this help\n\n\
+        🏠 LAN Discovery:\n\
+          • Automatic peer discovery in local network\n\
+          • No beacon required\n\
+          • Announces every 10 seconds\n\
+          • Direct P2P communication\n\n\
+        🌐 Beacon Mode:\n\
+          • Global peer discovery\n\
+          • Relay through VPS\n\
+          • Works across the internet\n\
         ";
 
-        let area = centered_rect(55, 65, f.size());
+        let area = centered_rect(60, 80, f.size());
         let help = Paragraph::new(help_text)
             .block(
                 Block::default()
-                    .title(" Help ")
+                    .title(" Help / Справка (press h to close)")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow)),
             )
             .wrap(Wrap { trim: true });
         f.render_widget(Clear, area);
         f.render_widget(help, area);
+    }
+
+    // === PEERS POPUP ===
+    if app.show_peers {
+        let mut peers_text = String::from("🌐 Connected Peers / Подключённые пиры\n");
+        peers_text.push_str(&format!("════════════════════════════════\n\n"));
+
+        if app.connected_peers_info.is_empty() {
+            peers_text.push_str("  No peers connected\n  Нет подключённых пиров\n");
+        } else {
+            for (i, (peer_id, username)) in app.connected_peers_info.iter().enumerate() {
+                let short_id = if peer_id.len() > 16 {
+                    format!("{}...{}", &peer_id[..8], &peer_id[peer_id.len() - 8..])
+                } else {
+                    peer_id.clone()
+                };
+                let is_lan = app.lan_mode; // Simplified
+                let indicator = if is_lan { "🏠" } else { "🌐" };
+                peers_text.push_str(&format!(
+                    "  {:<2} {} @{} ({}...)\n",
+                    i + 1,
+                    indicator,
+                    username,
+                    &peer_id[..8]
+                ));
+            }
+        }
+
+        peers_text.push_str(&format!(
+            "\n  Total: {} peers",
+            app.connected_peers_info.len()
+        ));
+        if app.lan_peer_count > 0 {
+            peers_text.push_str(&format!(" ({} LAN)", app.lan_peer_count));
+        }
+        peers_text.push_str("\n\n  Press 'p' to close");
+
+        let area = centered_rect(50, 60, f.size());
+        let peers = Paragraph::new(peers_text)
+            .block(
+                Block::default()
+                    .title(" Peers / Пиры ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Magenta)),
+            )
+            .wrap(Wrap { trim: true });
+        f.render_widget(Clear, area);
+        f.render_widget(peers, area);
     }
 }
 
