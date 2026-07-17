@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx_lan = tx.clone();
 
     tokio::spawn(async move {
-        let _ = lan_discovery_clone
+        if let Err(e) = lan_discovery_clone
             .listen(move |msg, addr| {
                 if msg.peer_id.to_lowercase() == my_peer_id_hex {
                     return; // Игнорируем собственные анонсы
@@ -115,7 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })
-            .await;
+            .await
+        {
+            eprintln!("❌ [LAN] Listen task failed: {}", e);
+        }
     });
 
     let lan_announce = lan_discovery.clone();
