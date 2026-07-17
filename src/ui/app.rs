@@ -160,24 +160,24 @@ impl App {
     }
 }
 
-/// Runs the TUI event loop.
-pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<String> {
+/// Runs the TUI event loop, mutating app state in place.
+pub fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> io::Result<Option<String>> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = std::time::Duration::from_millis(250);
-
     loop {
-        terminal.draw(|f| ui(f, &app))?;
-
+        terminal.draw(|f| ui(f, app))?;
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| std::time::Duration::from_secs(0));
-
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match app.input_mode {
                         InputMode::Normal => match key.code {
-                            KeyCode::Char('q') => return Ok("/quit".to_string()),
+                            KeyCode::Char('q') => return Ok(Some("/quit".to_string())),
                             KeyCode::Char('e') => {
                                 app.input_mode = InputMode::Editing;
                                 app.status = "✏️ Editing mode / Режим ввода".to_string();
@@ -202,7 +202,7 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                                 app.input_mode = InputMode::Normal;
                                 app.status = "Ready / Готов".to_string();
                                 if !input.is_empty() {
-                                    return Ok(input);
+                                    return Ok(Some(input));
                                 }
                             }
                             KeyCode::Esc => {
@@ -220,7 +220,6 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                 }
             }
         }
-
         if last_tick.elapsed() >= tick_rate {
             last_tick = std::time::Instant::now();
         }
