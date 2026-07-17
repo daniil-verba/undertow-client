@@ -1,4 +1,3 @@
-//! ## Undertow Client - P2P Node with TUI
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -6,7 +5,6 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-// use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
 use undertow_protocol::network::{
@@ -21,17 +19,14 @@ use crate::ui::app::{run_app, App};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // === PHASE 0: Load profile ===
     let profile = init_profile(None)?;
     let my_peer_id = profile.peer_id();
     let username = profile.username.clone();
 
     println!("🌊 UNDERTOW PROTOCOL — Node Setup");
-    println!("═══════════════════════════════════════════════════");
     println!("👤 Username: {}", username);
     println!("🔑 Peer ID: {}", my_peer_id);
 
-    // === PHASE 1: CLI Setup ===
     print!("📡 Node port [9001]: ");
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut port_input = String::new();
@@ -46,13 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nat_type_str = format!("{:?}", nat_info.nat_type);
     let external_str = nat_info.external_addr.map(|a| a.to_string());
 
-    // === PHASE 2: Setup LAN Beacon ===
+    // === ИСПОЛЬЗУЕМ LanBeacon ВМЕСТО LanDiscovery ===
     let lan_beacon = LanBeacon::new(*my_peer_id.as_bytes(), username.clone(), port).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<LanEvent>();
     lan_beacon.start(tx.clone()).await;
     println!("🏠 LAN Beacon started (multicast on 239.255.0.1:9003)");
 
-    // === PHASE 3: TUI Setup ===
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -66,32 +60,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_addr_strs.clone(),
         external_str.clone(),
         nat_type_str.clone(),
-        None, // beacon_addr = None (LAN only)
+        None,
     );
     app.add_system_message(format!(
-        " Node started on port {} | ID: {}",
+        "🚀 Node started on port {} | ID: {}",
         port,
         my_peer_id.to_string()
     ));
     app.add_system_message("🔍 Searching for peers in local network...".to_string());
 
-    // === PHASE 4: Main TUI Loop ===
     loop {
-        // 1. Process all pending LAN events
+        // 1. Обрабатываем ВСЕ сетевые события (пиры находятся АВТОМАТИЧЕСКИ)
         while let Ok(event) = rx.try_recv() {
             match event {
                 LanEvent::PeerJoined {
                     peer_id,
                     username,
-                    addr,
+                    addr: _,
                 } => {
                     let pid_hex = hex::encode(peer_id);
                     app.add_peer(pid_hex.clone(), username.clone());
                     app.add_system_message(format!(
-                        "🏠 LAN peer joined: {} ({}) at {}",
+                        "🏠 LAN peer joined: {} ({})",
                         username,
-                        &pid_hex[..8],
-                        addr
+                        &pid_hex[..8]
                     ));
                 }
                 LanEvent::PeerLeft { peer_id, username } => {
@@ -115,28 +107,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         app.set_lan_peer_count(app.connected_peers_info.len());
 
-        // 2. Draw UI (app state preserved!)
+        // 2. Отрисовываем UI. Передаем &mut app, чтобы состояние НЕ терялось!
         let input_opt = run_app(&mut terminal, &mut app)?;
 
-        // 3. Handle input
+        // 3. Обрабатываем ввод пользователя
         if let Some(input) = input_opt {
             if input == "/quit" {
                 lan_beacon.stop().await;
                 break;
             }
-
             if input == "/help" || input == "help" {
                 app.show_help = true;
             } else if input == "/peers" || input == "p" {
                 app.show_peers = !app.show_peers;
             } else if input == "/lan" {
-                // Сначала собираем данные, чтобы освободить неизменяемую ссылку на app
                 let peers_snapshot: Vec<(String, String)> = app
                     .connected_peers_info
                     .iter()
                     .map(|(id, name)| (id.clone(), name.clone()))
                     .collect();
-
                 app.add_system_message(format!("🏠 Active LAN peers: {}", peers_snapshot.len()));
                 for (id, name) in &peers_snapshot {
                     app.add_system_message(format!("  • {} ({})", name, &id[..8]));
@@ -172,9 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     nat.nat_type, nat.external_addr
                 ));
             } else if !input.starts_with('/') {
-                // === SEND MESSAGE (no slash) ===
+                // ОТПРАВКА СООБЩЕНИЯ БЕЗ КОМАНДЫ
                 if let Some(ref target_id_hex) = app.selected_chat {
-                    // Direct message
                     if let Ok(target_bytes) = hex::decode(target_id_hex) {
                         let mut target_array = [0u8; 32];
                         target_array.copy_from_slice(&target_bytes);
@@ -194,7 +182,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
-                    // Broadcast
                     match lan_beacon.broadcast_chat_message(input.clone()).await {
                         Ok(_) => {
                             app.add_message(my_peer_id.to_string(), input.clone());
@@ -210,7 +197,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Cleanup
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -218,6 +204,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    println!("\n Goodbye!");
+    println!("\n👋 Goodbye!");
     Ok(())
 }
