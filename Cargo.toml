@@ -12,9 +12,9 @@ name = "undertow"
 path = "src/main.rs"
 
 [dependencies]
-undertow-protocol = { git = "https://gitverse.ru/daniil-verba/undertow-protocol", default-features = false, features = ["network", "storage"] }
+undertow-protocol = { git = "https://github.com/daniil-verba/undertow-protocol", branch = "feat/iroh", default-features = false, features = ["network", "storage"] }
 tokio = { version = "1", features = ["full"] }
-
+iroh = "1.0"
 # UI dependencies (same versions as in protocol)
 ratatui = "0.24"
 crossterm = "0.27"

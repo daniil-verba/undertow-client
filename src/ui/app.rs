@@ -1,7 +1,4 @@
 //! ## TUI Application / TUI-приложение
-//!
-//! Beautiful terminal interface for the Undertow node.
-//! / Красивый терминальный интерфейс для узла Undertow.
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -12,50 +9,41 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
-use undertow_protocol::network::lan_beacon::LanBeacon;
+use undertow_protocol::protocol::peer_id::PeerId;
+
+/// События, которые сетевой слой передает в UI
+pub enum UiEvent {
+    MessageReceived(PeerId, String),
+    SystemMessage(String),
+    Error(String),
+    PeerDiscovered(PeerId, String),
+}
+
+/// Структура сообщения чата
+pub struct ChatMessage {
+    pub sender: PeerId,
+    pub text: String,
+    pub time: String,
+    pub is_system: bool,
+}
 
 /// Application state / Состояние приложения
 pub struct App {
-    /// My PeerId / Мой PeerId
-    pub peer_id: String,
-    /// My short PeerId / Мой короткий PeerId
-    pub peer_id_short: String,
-    /// My username / Моё имя пользователя
+    pub my_peer_id: PeerId,
     pub username: String,
-    /// Local IP addresses / Локальные IP-адреса
-    pub local_addrs: Vec<String>,
-    /// External IP:port from STUN / Внешний IP:порт от STUN
-    pub external_addr: Option<String>,
-    /// NAT type / Тип NAT
-    pub nat_type: String,
-    /// Connected beacon address / Адрес подключённого маяка
-    pub beacon_addr: Option<String>,
-    /// Chat messages: (sender_short, sender_full, text_with_time)
-    pub messages: Vec<(String, String, String)>,
-    /// Input buffer / Буфер ввода
+    pub messages: Vec<ChatMessage>,
     pub input: String,
-    /// Input mode / Режим ввода
     pub input_mode: InputMode,
-    /// Scroll position / Позиция прокрутки
     pub scroll: usize,
-    /// Connected peers / Подключённые пиры
-    pub connected_peers: Vec<String>,
-    /// Connected peers with usernames / Подключённые пиры с именами
-    pub connected_peers_info: Vec<(String, String)>, // (peer_id, username)
-    /// Status message / Статусное сообщение
+    pub known_peers: Vec<PeerId>,
     pub status: String,
-    /// Show help popup / Показать всплывающую справку
     pub show_help: bool,
-    /// LAN peers
-    pub lan_peers: Vec<(String, String)>, // (peer_id, username)
-    /// LAN beacon reference (optional)
-    pub lan_beacon: Option<Arc<LanBeacon>>,
-    /// Change name mode
-    pub changing_name: bool,
-    /// New name buffer
-    pub new_name: String,
+    /// Маппинг username → PeerId для отправки по имени
+    pub username_to_peer: HashMap<String, PeerId>,
+    /// Обратный маппинг PeerId → username для отображения
+    pub peer_to_username: HashMap<PeerId, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,149 +53,79 @@ pub enum InputMode {
 }
 
 impl App {
-    /// Creates a new App with node info.
-    pub fn new(
-        peer_id: String,
-        username: String,
-        local_addrs: Vec<String>,
-        external_addr: Option<String>,
-        nat_type: String,
-        beacon_addr: Option<String>,
-    ) -> Self {
-        let peer_id_short = peer_id.chars().take(8).collect();
-
+    pub fn new(my_peer_id: PeerId, username: String) -> Self {
         Self {
-            peer_id,
-            peer_id_short,
+            my_peer_id,
             username,
-            local_addrs,
-            external_addr,
-            nat_type,
-            beacon_addr,
             messages: Vec::new(),
             input: String::new(),
             input_mode: InputMode::Normal,
             scroll: 0,
-            connected_peers: Vec::new(),
-            connected_peers_info: Vec::new(),
-            status: "Ready / Готов".to_string(),
+            known_peers: Vec::new(),
+            status: "Ready (Press 'e' to write, 'h' for help)".to_string(),
             show_help: false,
-            lan_peers: Vec::new(),
-            lan_beacon: None,
-            changing_name: false,
-            new_name: String::new(),
+            username_to_peer: HashMap::new(),
+            peer_to_username: HashMap::new(),
         }
     }
 
-    /// Adds a received chat message.
-    pub fn add_message(&mut self, sender_full: String, text: String) {
-        let sender_short: String = sender_full.chars().take(8).collect();
+    pub fn add_message(&mut self, sender: PeerId, text: String) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        self.messages
-            .push((sender_short, sender_full, format!("[{}] {}", time, text)));
+        self.messages.push(ChatMessage {
+            sender,
+            text,
+            time,
+            is_system: false,
+        });
         if self.messages.len() > 500 {
             self.messages.remove(0);
         }
+        if !self.known_peers.contains(&sender) {
+            self.known_peers.push(sender);
+        }
+        self.scroll = self.messages.len().saturating_sub(1);
     }
 
-    /// Adds a system message (yellow SYS prefix).
     pub fn add_system_message(&mut self, text: String) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        self.messages.push((
-            "SYS".to_string(),
-            "SYSTEM".to_string(),
-            format!("[{}] {}", time, text),
-        ));
+        self.messages.push(ChatMessage {
+            sender: self.my_peer_id,
+            text: format!("[SYS] {}", text),
+            time,
+            is_system: true,
+        });
+        if self.messages.len() > 500 {
+            self.messages.remove(0);
+        }
+        self.scroll = self.messages.len().saturating_sub(1);
     }
 
-    /// Adds a connected peer with username.
-    pub fn add_peer(&mut self, peer_id: String, username: String) {
-        let short_id = if peer_id.len() > 8 {
-            format!("{}...", &peer_id[..8])
-        } else {
-            peer_id.clone()
-        };
-        let display = format!("{} (@{})", short_id, username);
-        if !self.connected_peers.contains(&display) {
-            self.connected_peers.push(display);
-            self.connected_peers_info.push((peer_id, username));
+    /// Регистрирует пира с его username
+    pub fn register_peer(&mut self, username: String, peer_id: PeerId) {
+        self.username_to_peer.insert(username.clone(), peer_id);
+        self.peer_to_username.insert(peer_id, username.clone());
+        if !self.known_peers.contains(&peer_id) {
+            self.known_peers.push(peer_id);
         }
     }
 
-    /// Removes a connected peer.
-    pub fn remove_peer(&mut self, peer_id: &str) {
-        self.connected_peers_info.retain(|(id, _)| id != peer_id);
-        self.connected_peers.retain(|p| !p.contains(peer_id));
-    }
-    /// Updates peer list from beacon info.
-    pub fn update_peers(&mut self, peers: Vec<(String, String)>) {
-        self.connected_peers.clear();
-        self.connected_peers_info.clear();
-        for (peer_id, username) in peers {
-            self.add_peer(peer_id, username);
-        }
+    /// Ищет PeerId по username
+    pub fn find_peer_by_username(&self, username: &str) -> Option<PeerId> {
+        self.username_to_peer.get(username).copied()
     }
 
-    /// Updates LAN peers list
-    pub fn update_lan_peers(&mut self, peers: Vec<(String, String)>) {
-        self.lan_peers = peers;
-    }
-
-    /// Adds a LAN peer
-    pub fn add_lan_peer(&mut self, peer_id: String, username: String) {
-        if !self.lan_peers.iter().any(|(id, _)| id == &peer_id) {
-            self.lan_peers.push((peer_id, username));
-        }
-    }
-
-    /// Removes a LAN peer
-    pub fn remove_lan_peer(&mut self, peer_id: &str) {
-        self.lan_peers.retain(|(id, _)| id != peer_id);
-    }
-
-    /// Starts changing name mode
-    pub fn start_change_name(&mut self) {
-        self.changing_name = true;
-        self.new_name = self.username.clone();
-        self.input_mode = InputMode::Editing;
-        self.status = "Enter new username (ESC to cancel, Enter to confirm)".to_string();
-    }
-
-    /// Confirms name change
-    pub fn confirm_name_change(&mut self) -> Result<(), String> {
-        let new_name = self.new_name.trim();
-        if new_name.is_empty() {
-            return Err("Username cannot be empty".to_string());
-        }
-        if new_name.len() > 32 {
-            return Err("Username too long (max 32 chars)".to_string());
-        }
-
-        // Обновляем имя в профиле
-        // Это будет делаться в main.rs
-        self.status = format!("Username changed to: {}", new_name);
-        self.changing_name = false;
-        self.input_mode = InputMode::Normal;
-        Ok(())
-    }
-
-    /// Cancels name change
-    pub fn cancel_name_change(&mut self) {
-        self.changing_name = false;
-        self.new_name.clear();
-        self.input_mode = InputMode::Normal;
-        self.status = "Name change cancelled".to_string();
+    /// Получает username по PeerId
+    pub fn get_username(&self, peer_id: &PeerId) -> Option<String> {
+        self.peer_to_username.get(peer_id).cloned()
     }
 }
 
-/// Runs the TUI event loop.
 pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(String, App)> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = std::time::Duration::from_millis(250);
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
-
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| std::time::Duration::from_secs(0));
@@ -220,14 +138,10 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                             KeyCode::Char('q') => return Ok(("/quit".to_string(), app)),
                             KeyCode::Char('e') => {
                                 app.input_mode = InputMode::Editing;
-                                app.status = "Editing mode / Режим ввода".to_string();
+                                app.status = "Editing mode (ESC=Cancel, Enter=Send)".to_string();
                             }
                             KeyCode::Char('h') => app.show_help = !app.show_help,
-                            KeyCode::Up => {
-                                if app.scroll > 0 {
-                                    app.scroll -= 1;
-                                }
-                            }
+                            KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
                             KeyCode::Down => app.scroll += 1,
                             _ => {}
                         },
@@ -236,7 +150,7 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                                 let input = app.input.trim().to_string();
                                 app.input.clear();
                                 app.input_mode = InputMode::Normal;
-                                app.status = "Ready / Готов".to_string();
+                                app.status = "Ready".to_string();
                                 if !input.is_empty() {
                                     return Ok((input, app));
                                 }
@@ -244,7 +158,7 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                             KeyCode::Esc => {
                                 app.input.clear();
                                 app.input_mode = InputMode::Normal;
-                                app.status = "Ready / Готов".to_string();
+                                app.status = "Ready".to_string();
                             }
                             KeyCode::Char(c) => app.input.push(c),
                             KeyCode::Backspace => {
@@ -256,32 +170,29 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                 }
             }
         }
-
         if last_tick.elapsed() >= tick_rate {
             last_tick = std::time::Instant::now();
         }
     }
 }
 
-/// Renders the complete UI layout.
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(8), // Info panel
-            Constraint::Min(10),   // Main content
-            Constraint::Length(3), // Input
-            Constraint::Length(1), // Status
+            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(f.size());
 
-    // === TITLE BAR ===
     let title = Paragraph::new(Text::from(vec![Line::from(vec![
         Span::styled(" 🌊 ", Style::default().fg(Color::Cyan)),
         Span::styled(
-            "UNDERTOW PROTOCOL",
+            "UNDERTOW P2P",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -290,10 +201,7 @@ fn ui(f: &mut Frame, app: &App) {
             format!(" — {} ", app.username),
             Style::default().fg(Color::LightGreen),
         ),
-        Span::styled(
-            "— Decentralized P2P Messenger",
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled("| Powered by Iroh", Style::default().fg(Color::Gray)),
     ])]))
     .alignment(Alignment::Center)
     .block(
@@ -303,60 +211,58 @@ fn ui(f: &mut Frame, app: &App) {
     );
     f.render_widget(title, chunks[0]);
 
-    // === INFO PANEL ===
     let info_text = format!(
-        "👤 {} ({})\n\
-         🏠 Local: {}\n\
-         🌍 External: {}\n\
-         🔥 NAT: {} | 🗼 Beacon: {} | 📡 Peers: {}",
+        "👤 {} ({})\n🔑 PeerID: {}",
         app.username,
-        app.peer_id_short,
-        app.local_addrs.join(", "),
-        app.external_addr.as_deref().unwrap_or("Unknown"),
-        app.nat_type,
-        app.beacon_addr.as_deref().unwrap_or("None"),
-        app.connected_peers.len(),
+        app.my_peer_id.short(),
+        app.my_peer_id.to_hex()
     );
-
     let info = Paragraph::new(info_text)
         .block(
             Block::default()
-                .title(" Node Info ")
+                .title(" Node Info (Share your PeerID to connect) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Green)),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(info, chunks[1]);
 
-    // === MAIN CONTENT: Chat + Peers ===
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(chunks[2]);
-
-    // Chat messages
     let messages_text: Vec<Line> = app
         .messages
         .iter()
-        .map(|(short, full, text)| {
-            let color = if short == "SYS" {
-                Color::Yellow
-            } else if short == &app.peer_id_short || short == &app.username {
-                Color::Green
-            } else {
-                Color::Cyan
-            };
-            let prefix = if short == &app.username || short == &app.peer_id_short {
+        .map(|msg| {
+            if msg.is_system {
+                return Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", msg.time),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        &msg.text,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]);
+            }
+            let is_me = msg.sender == app.my_peer_id;
+            let color = if is_me { Color::Green } else { Color::Cyan };
+            let prefix = if is_me {
                 "You"
             } else {
-                short
+                &app.get_username(&msg.sender)
+                    .unwrap_or_else(|| msg.sender.short())
             };
             Line::from(vec![
                 Span::styled(
-                    format!("{} ", prefix),
+                    format!("[{}] ", msg.time),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{}: ", prefix),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(text.clone(), Style::default().fg(Color::White)),
+                Span::styled(&msg.text, Style::default().fg(Color::White)),
             ])
         })
         .collect();
@@ -364,91 +270,24 @@ fn ui(f: &mut Frame, app: &App) {
     let messages = Paragraph::new(Text::from(messages_text))
         .block(
             Block::default()
-                .title(" Chat ")
+                .title(format!(" Chat [{} peers known] ", app.known_peers.len()))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
         .wrap(Wrap { trim: true })
         .scroll((app.scroll as u16, 0));
-    f.render_widget(messages, main_chunks[0]);
+    f.render_widget(messages, chunks[2]);
 
-    // Peers list with usernames
-    // В функции ui() найти эту секцию:
-    // Peers list with usernames
-    let peers_text = if app.connected_peers.is_empty() {
-        "No peers connected".to_string()
-    } else {
-        app.connected_peers.join("\n")
-    };
-
-    let peers = Paragraph::new(peers_text)
-        .block(
-            Block::default()
-                .title(format!(" Peers [{}] ", app.connected_peers.len()))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(peers, main_chunks[1]);
-
-    // И ЗАМЕНИТЬ её на:
-
-    // Peers list with usernames (LAN + Beacon)
-    let mut peers_text = String::new();
-
-    // LAN Peers
-    if !app.lan_peers.is_empty() {
-        peers_text.push_str("🌐 LAN Peers:\n");
-        for (id, username) in &app.lan_peers {
-            let short_id = if id.len() > 8 {
-                format!("{}...", &id[..8])
-            } else {
-                id.clone()
-            };
-            peers_text.push_str(&format!("  🟢 {} (@{})\n", short_id, username));
-        }
-        peers_text.push_str("\n");
-    }
-
-    // Beacon Peers
-    if !app.connected_peers.is_empty() {
-        peers_text.push_str("📡 Beacon Peers:\n");
-        for peer in &app.connected_peers {
-            peers_text.push_str(&format!("  {}\n", peer));
-        }
-    }
-
-    if peers_text.is_empty() {
-        peers_text = "No peers connected".to_string();
-    }
-
-    let peers = Paragraph::new(peers_text)
-        .block(
-            Block::default()
-                .title(format!(
-                    " Peers [LAN: {}, Beacon: {}] ",
-                    app.lan_peers.len(),
-                    app.connected_peers.len()
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(peers, main_chunks[1]);
-
-    // === INPUT BAR ===
     let input_style = if app.input_mode == InputMode::Editing {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Gray)
     };
-
     let input_label = if app.input_mode == InputMode::Editing {
         " Send message (ESC=Cancel) "
     } else {
         " 'e'=write, 'h'=help, 'q'=quit "
     };
-
     let input = Paragraph::new(app.input.clone()).style(input_style).block(
         Block::default()
             .title(input_label)
@@ -457,36 +296,21 @@ fn ui(f: &mut Frame, app: &App) {
     );
     f.render_widget(input, chunks[3]);
 
-    // === STATUS BAR ===
     let status = Paragraph::new(format!(" {} ", app.status))
         .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(status, chunks[4]);
 
-    // === HELP POPUP ===
     if app.show_help {
         let help_text = "\
-        🌊 UNDERTOW PROTOCOL — Help\n\n\
-        Keys:\n\
-          e       — Start writing\n\
-          Enter   — Send\n\
-          ESC     — Cancel\n\
-          h       — Toggle help\n\
-          ↑,↓     — Scroll chat\n\
-          q       — Quit\n\n\
+        🌊 UNDERTOW P2P — Help\n\n\
+        Keys:\n  e=write, Enter=send, ESC=cancel, h=help, ↑↓=scroll, q=quit\n\n\
         Commands:\n\
-          /name <username>      — Change your username\n\
-          /lan                  — Show LAN peers\n\
-          /msg-lan <name> <msg> — Send message to LAN peer\n\
-          /broadcast <msg>      — Broadcast to all LAN peers\n\
-          /msg <username> <msg> — Send via beacon\n\
-          /send <peer_id> <msg> — Send by PeerId\n\
-          /peers                — List connected peers\n\
-          /ping <addr>          — Ping node\n\
-          /nat                  — Detect NAT\n\
-          /help                 — Show this help\n\
-        ";
-
-        let area = centered_rect(55, 65, f.size());
+          /msg <username> <msg>  — Send to user by name\n\
+          /send <peer_id> <msg>  — Send by full PeerId (global)\n\
+          /peers                 — List known peers\n\
+          /id                    — Show my full PeerID\n\
+          /help                  — Show this help\n";
+        let area = centered_rect(60, 60, f.size());
         let help = Paragraph::new(help_text)
             .block(
                 Block::default()
@@ -500,7 +324,6 @@ fn ui(f: &mut Frame, app: &App) {
     }
 }
 
-/// Creates a centered rectangle for popups.
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -510,7 +333,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(r);
-
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
