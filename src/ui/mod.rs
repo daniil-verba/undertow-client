@@ -4,4 +4,4 @@
 //! / Терминальный интерфейс пользователя на ratatui.
 
 pub mod app;
-pub mod widgets;
+// pub mod widgets;
